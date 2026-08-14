@@ -1,0 +1,44 @@
+# CodeRabbit config for the nstrelow/SoulSync fork.
+# Goal: catch issues on fork-internal PRs (feature branch -> dev/main here)
+# before the same diff goes out as a PR to Nezreka/SoulSync upstream.
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - main
+      - dev
+  path_filters:
+    - "!**/*.lock"
+    - "!**/*.md"
+    - "!Issue/**"
+    - "!docs/**"
+    - "!database/migrations/**"
+  path_instructions:
+    - path: "tests/**"
+      instructions: >
+        Test code: flag missing coverage for the changed behavior, but don't
+        insist on production-level style (asserts, magic values, and fixture
+        duplication are fine here).
+    - path: "core/**"
+      instructions: >
+        Core library code: pay close attention to blocking/async correctness,
+        SQLite access patterns (this project has been bitten by full-table
+        scans and stray config DBs from a missing DATABASE_PATH env var), and
+        any change touching wishlist/discovery/import matching thresholds.
+  tools:
+    ruff:
+      enabled: true
+
+chat:
+  auto_reply: true
