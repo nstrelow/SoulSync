@@ -589,10 +589,33 @@ def remove_tracks_already_in_library(
         for t in wishlist_service.get_wishlist_tracks_for_download(profile_id=pid):
             cleanup_tracks.append((pid, t))
 
+    from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
+
     cleanup_removed = 0
     for profile_id, track in cleanup_tracks:
         if skip_track_fn and skip_track_fn(track):
             continue
+        # this runs as a background job, so "already in the library" has to be
+        # asked through the wishlist owner's library, not the job's (#1199): an
+        # own-library profile's wishlist entry is not cleared by the admin
+        # owning the track
+        _scope_token = set_library_scope(library_scope_for_profile(profile_id))
+        try:
+            removed_here = _cleanup_one(
+                wishlist_service, music_database, _mlm, profile_id, track, active_server,
+                logger=logger, log_prefix=log_prefix)
+        finally:
+            reset_library_scope(_scope_token)
+        cleanup_removed += removed_here
+    return cleanup_removed
+
+
+def _cleanup_one(wishlist_service, music_database, _mlm, profile_id, track, active_server, *, logger, log_prefix) -> int:
+    """one wishlist entry: 1 when it was removed as already owned, else 0.
+    the loop body of remove_tracks_already_in_library, lifted so it runs
+    inside that profile's library scope."""
+    cleanup_removed = 0
+    if True:
 
         track_name = track.get('name', '')
         artists = track.get('artists', [])
@@ -600,18 +623,19 @@ def remove_tracks_already_in_library(
         track_album = track.get('album', {}).get('name') if isinstance(track.get('album'), dict) else track.get('album')
 
         if not track_name or not artists or not spotify_track_id:
-            continue
+            return 0
 
         # Manual match check — skip fuzzy search if user already linked this track.
-        if _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist'):
+        manual_match = _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist')
+        if manual_match and _mlm.match_is_live(music_database, manual_match):
             try:
-                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True, profile_id=profile_id)
                 if removed:
                     cleanup_removed += 1
                     logger.info(f"{log_prefix} [Manual Match] Skipped already-matched track: '{track_name}'")
             except Exception as _mlm_err:
                 logger.error(f"{log_prefix} [Manual Match] Error removing track: {_mlm_err}")
-            continue
+            return cleanup_removed
 
         found_in_db = False
         matched_artist_name = ''
@@ -641,7 +665,7 @@ def remove_tracks_already_in_library(
 
         if found_in_db:
             try:
-                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True, profile_id=profile_id)
                 if removed:
                     cleanup_removed += 1
                     logger.info(f"{log_prefix} Removed already-owned track: '{track_name}' by {matched_artist_name or artist_name}")
@@ -985,6 +1009,31 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
                 # may state intent via apply_backoff; otherwise a present
                 # automation_id marks the run as scheduled.
                 _backoff = apply_backoff if apply_backoff is not None else (automation_id is not None)
+                # "The user asked for this run" — the same condition that skips
+                # backoff. Named because the empty-category branch below needs it too.
+                _is_user_initiated = not _backoff
+
+                # A manual run is the user saying "the source is back, try
+                # again". Selection already ignored backoff for these, but the
+                # stored counters were left untouched, so the NEXT scheduled
+                # cycle still saw retry_count=4 and sat the track out for
+                # another 7 days — tracks that failed during an outage stayed
+                # stranded long after it ended (#1196, Zombiehamser: 634 of 674
+                # stuck at retry 3-4). Clearing the clock for the tracks this
+                # run is about to attempt makes the recovery real.
+                if _is_user_initiated:
+                    try:
+                        _cleared = music_database.reset_wishlist_retry_backoff(
+                            [t.get('spotify_track_id') or t.get('track_id') or t.get('id')
+                             for t in wishlist_tracks])
+                        if _cleared:
+                            logger.info(
+                                f"[Auto-Wishlist] Manual run — cleared retry backoff on "
+                                f"{_cleared} previously-failing track(s)")
+                    except Exception:
+                        # bookkeeping must never stop the actual run
+                        logger.exception("[Auto-Wishlist] Could not clear retry backoff")
+
                 if _backoff:
                     from datetime import datetime as _dt, timezone as _tz
 
@@ -1017,13 +1066,32 @@ def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, autom
 
                 # If no tracks in this category, skip to next cycle immediately
                 if len(filtered_tracks) == 0:
-                    logger.warning(f"ℹ️ [Auto-Wishlist] No {current_cycle} tracks in wishlist, toggling cycle and scheduling next run")
-
-                    # Toggle cycle
                     next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
-                    set_wishlist_cycle(lambda: music_database, next_cycle)
-                    logger.info(f"[Auto-Wishlist] Cycle toggled: {current_cycle} → {next_cycle}")
-                    return
+
+                    # A SCHEDULED run can afford to wait for its next tick, but
+                    # a user click must never be a silent no-op: Zombiehamser
+                    # pressed "process wishlist" against 674 tracks and got no
+                    # batch and "no active work" because the hidden cycle
+                    # happened to sit on the empty category (#1196). One click =
+                    # one real attempt, so try the other category right now.
+                    _other, _ = filter_wishlist_tracks_by_category(wishlist_tracks, next_cycle)
+                    if _is_user_initiated and _other:
+                        logger.info(
+                            f"[Auto-Wishlist] No {current_cycle} tracks — user-initiated run, "
+                            f"switching to {next_cycle} ({len(_other)} track(s)) instead of idling")
+                        set_wishlist_cycle(lambda: music_database, next_cycle)
+                        current_cycle = next_cycle
+                        filtered_tracks = _other
+                    else:
+                        logger.warning(f"ℹ️ [Auto-Wishlist] No {current_cycle} tracks in wishlist, toggling cycle and scheduling next run")
+                        set_wishlist_cycle(lambda: music_database, next_cycle)
+                        logger.info(f"[Auto-Wishlist] Cycle toggled: {current_cycle} → {next_cycle}")
+                        runtime.update_automation_progress(
+                            automation_id, log_line=(
+                                f'No {current_cycle} tracks this cycle — switched to '
+                                f'{next_cycle} for the next run'),
+                            log_type='info')
+                        return
 
                 # Use filtered tracks for processing — stamp original index
                 wishlist_tracks = filtered_tracks

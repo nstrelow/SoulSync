@@ -34,6 +34,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from core.downloads.prioritize import (
+    batch_wake_sort_key,
+    should_defer_batch_start,
+    top_promoted_batch_id,
+)
 from core.downloads.history import record_sync_history_completion
 from core.runtime_state import (
     add_activity_item,
@@ -220,10 +225,67 @@ def _cleanup_private_album_bundle_staging(batch_id: str, batch: dict) -> None:
         logger.warning("[Album Bundle] Could not clean private staging folder %s: %s", staging_path, exc)
 
 
+# Audio a stranded bundle might still be holding. Same list the auto-import
+# worker uses; kept local so this module doesn't import the import pipeline.
+_ORPHAN_RESCUE_AUDIO_EXTS = {
+    '.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma',
+    '.aiff', '.aif', '.ape',
+}
+
+
+def _dir_holds_audio(path: Path) -> bool:
+    try:
+        for child in path.rglob('*'):
+            if child.is_file() and child.suffix.lower() in _ORPHAN_RESCUE_AUDIO_EXTS:
+                return True
+    except OSError:
+        # Unreadable is not the same as empty. Say yes so the caller keeps it.
+        return True
+    return False
+
+
+def _rescue_orphan_staging_dir(entry: Path, rescue_root: str) -> bool:
+    """Move a stranded bundle into the recycle bin instead of deleting it.
+
+    Lands at ``<rescue_root>/album_bundle_orphans/<batch dir>/`` and every audio
+    file is written into the quarantine manifest, so the files show up in the
+    Downloads recycle bin and can be restored like anything else. Returns True
+    when the dir was moved off the staging root.
+    """
+    try:
+        from core.library.deleted_quarantine import record_deleted_entry
+
+        dest_parent = Path(rescue_root) / 'album_bundle_orphans'
+        dest_parent.mkdir(parents=True, exist_ok=True)
+        dest = dest_parent / entry.name
+        # A previous rescue of the same batch id would collide; keep both.
+        suffix = 1
+        while dest.exists():
+            dest = dest_parent / f"{entry.name}__{suffix}"
+            suffix += 1
+        shutil.move(str(entry), str(dest))
+        for child in dest.rglob('*'):
+            if child.is_file() and child.suffix.lower() in _ORPHAN_RESCUE_AUDIO_EXTS:
+                original = str(entry / child.relative_to(dest))
+                record_deleted_entry(rescue_root, str(child), original, 'album_bundle_orphan')
+        logger.warning(
+            "[Album Bundle Sweep] Stranded album bundle %s still had audio in it. "
+            "Moved to the recycle bin at %s instead of deleting it.", entry.name, dest,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[Album Bundle Sweep] Could not rescue orphan staging dir %s: %s. "
+            "Leaving it on disk rather than deleting it.", entry, exc,
+        )
+        return False
+
+
 def sweep_orphan_album_bundle_staging(
     staging_root: str,
     *,
     active_batch_ids: Optional[set] = None,
+    rescue_root: Optional[str] = None,
 ) -> int:
     """Remove orphan per-batch dirs from album-bundle staging.
 
@@ -278,6 +340,16 @@ def sweep_orphan_album_bundle_staging(
             continue
         if entry.name in active_dirnames:
             continue
+        # An orphan dir can still be holding finished audio: an atomic-album
+        # batch that stalled downloaded its tracks here and never got to move
+        # them into the library. rmtree destroyed those on the next start, and
+        # a user who went looking found their album gone with one INFO line to
+        # explain it (#1210). Quarantine instead, the way every other delete
+        # path in this app already does.
+        if rescue_root and _dir_holds_audio(entry):
+            if _rescue_orphan_staging_dir(entry, rescue_root):
+                removed += 1
+            continue
         try:
             shutil.rmtree(entry)
             removed += 1
@@ -331,6 +403,30 @@ class LifecycleDeps:
 
 
 # ---------------------------------------------------------------------------
+# is_music_batch helper
+# ---------------------------------------------------------------------------
+
+def is_music_batch(batch_id: str, batch: Optional[dict] = None) -> bool:
+    """Determine if a batch belongs to the music download pipeline.
+
+    Batches that manage their own lifecycle (such as podcast downloads)
+    must not be picked up by music download workers, batch healers,
+    or the music wishlist failure processor.
+    """
+    if batch_id == "podcasts":
+        return False
+    if batch is None:
+        batch = download_batches.get(batch_id, {})
+    if not isinstance(batch, dict):
+        return True
+    if batch.get("is_music") is False or batch.get("managed_externally") is True:
+        return False
+    if batch.get("source_page") == "Podcasts" or batch.get("batch_type") == "podcast":
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # start_next_batch_of_downloads
 # ---------------------------------------------------------------------------
 
@@ -351,6 +447,10 @@ def start_next_batch_of_downloads(batch_id: str, deps: LifecycleDeps) -> None:
                 return
 
             batch = download_batches[batch_id]
+            if not is_music_batch(batch_id, batch):
+                logger.info(f"[Batch Manager] Skipping worker dispatch for non-music batch {batch_id}")
+                return
+
             max_concurrent = batch['max_concurrent']
             queue = batch['queue']
             queue_index = batch['queue_index']
@@ -380,11 +480,20 @@ def start_next_batch_of_downloads(batch_id: str, deps: LifecycleDeps) -> None:
 
             logger.info(f"[Batch Lock] Starting workers for {batch_id}: active={active_count}, max={max_concurrent}, queue_pos={queue_index}/{len(queue)}, global_max={global_max}")
 
+            if should_defer_batch_start(batch_id, download_batches, download_tasks):
+                logger.info(
+                    "[Batch Lock] %s yielding to a user-prioritized batch",
+                    batch_id,
+                )
+                return
+
             # Start downloads up to the concurrent limit
             while active_count < max_concurrent and queue_index < len(queue):
                 if global_max is not None:
                     total_active = sum(
-                        b.get('active_count', 0) for b in download_batches.values()
+                        b.get('active_count', 0)
+                        for bid, b in download_batches.items()
+                        if is_music_batch(bid, b)
                     )
                     if total_active >= global_max:
                         logger.info(
@@ -471,13 +580,20 @@ def _wake_waiting_batches(finished_batch_id: str, deps: LifecycleDeps) -> None:
     order — the deadlock this codebase has already been bitten by.
     """
     if deps.get_global_max_concurrent is None:
-        return
+        with tasks_lock:
+            has_promoted_batch = (
+                top_promoted_batch_id(download_batches, download_tasks) is not None
+            )
+        if not has_promoted_batch:
+            return
 
     waiting = []
     try:
         with tasks_lock:
             for other_id, other in download_batches.items():
                 if other_id == finished_batch_id:
+                    continue
+                if not is_music_batch(other_id, other):
                     continue
                 if other.get('phase') in ('complete', 'error', 'cancelled', 'failed'):
                     continue
@@ -497,16 +613,218 @@ def _wake_waiting_batches(finished_batch_id: str, deps: LifecycleDeps) -> None:
     except Exception:  # noqa: BLE001
         global_max = None
 
+    waiting.sort(
+        key=lambda bid: batch_wake_sort_key(bid, download_batches.get(bid, {}))
+    )
     for other_id in waiting:
         if global_max is not None:
             with tasks_lock:
-                total_active = sum(b.get('active_count', 0) for b in download_batches.values())
+                total_active = sum(
+                    b.get('active_count', 0)
+                    for bid, b in download_batches.items()
+                    if is_music_batch(bid, b)
+                )
             if total_active >= global_max:
                 break
         try:
             start_next_batch_of_downloads(other_id, deps)
         except Exception as wake_error:  # noqa: BLE001
             logger.error(f"[Batch Manager] Error waking batch {other_id}: {wake_error}")
+
+
+def _adopt_loose_tracks(cons_files, tag: str, album_context=None) -> None:
+    """the non-album-batch half of the consistency pass. file i/o only, no
+    network, non-fatal: a failure here must never hold up batch completion.
+
+    a pinned edition wins, same as the album path: the per-track tagger
+    already wrote the release the user chose, and the siblings may predate
+    the pin. adopting from them would undo the choice."""
+    try:
+        from core.album_consistency import adopt_sibling_tags_for_loose_tracks
+        from core.metadata.common import get_file_lock
+        from core.metadata.musicbrainz_tags import selected_release_id
+        if selected_release_id(album_context):
+            logger.info(f"{tag} Loose track(s) keep the pinned release; not adopting folder tags")
+            return
+        outcome = adopt_sibling_tags_for_loose_tracks(cons_files, file_lock_fn=get_file_lock)
+        if outcome.get('written'):
+            logger.info(f"{tag} {outcome['written']}/{outcome['total_files']} loose track(s) "
+                        f"adopted the album tags already on disk")
+        elif outcome.get('gated'):
+            logger.info(f"{tag} {outcome['gated']} loose track(s) left alone: album tag differs from the folder's")
+    except Exception as cons_err:
+        logger.error(f"{tag} Loose-track adoption failed (non-fatal): {cons_err}")
+
+
+def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
+                         queue: list, finished_count: int, tag: str) -> dict:
+    """Flip a finished batch to 'complete' and do the bookkeeping that has to
+    happen under tasks_lock: the phase itself, sync history, the activity line,
+    the batch_complete event, the discovery-state phases, the monitor and the
+    private staging cleanup. Returns what the out-of-lock half needs: the m3u
+    rows and a snapshot of this batch's tasks. CALLED UNDER tasks_lock.
+
+    one function for both completion paths. check_batch_completion_v2 (the
+    cancel and batch-healing path) used to carry its own copy of this block
+    and that copy had no sync-history write and no m3u regen, so a sync whose
+    last track was cancelled sat in the history as "In progress" forever."""
+    batch['phase'] = 'complete'
+    batch['completion_time'] = time.time()  # Track when batch completed
+
+    # Record sync history completion (reads download_tasks, so under the lock)
+    from database.music_database import MusicDatabase
+    record_sync_history_completion(MusicDatabase(), batch_id, batch)
+
+    # Add activity for batch completion
+    playlist_name = batch.get('playlist_name', 'Unknown Playlist')
+    failed_count = len(batch.get('permanently_failed_tracks', []))
+    successful_downloads = finished_count - failed_count
+    add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
+
+    # Emit batch_complete event for automation engine (only if something downloaded)
+    if successful_downloads > 0:
+        try:
+            if deps.automation_engine:
+                deps.automation_engine.emit('batch_complete', {
+                    'playlist_name': playlist_name,
+                    'total_tracks': str(len(queue)),
+                    'completed_tracks': str(successful_downloads),
+                    'failed_tracks': str(failed_count),
+                })
+        except Exception as e:
+            logger.debug("batch_complete emit failed: %s", e)
+
+    # Update the discovery-state phase for the playlist source this batch came from
+    playlist_id = batch.get('playlist_id')
+    for prefix, states, label in (
+        ('youtube_', deps.youtube_playlist_states, 'YouTube'),
+        ('tidal_', deps.tidal_discovery_states, 'Tidal'),
+        ('deezer_', deps.deezer_discovery_states, 'Deezer'),
+        ('spotify_public_', deps.spotify_public_discovery_states, 'Spotify Public'),
+    ):
+        if playlist_id and playlist_id.startswith(prefix):
+            key = playlist_id.replace(prefix, '')
+            if key in states:
+                states[key]['phase'] = 'download_complete'
+                logger.info(f"{tag} Updated {label} playlist {key} to download_complete phase")
+
+    logger.info(f"{tag} Batch {batch_id} complete - stopping monitor")
+    deps.download_monitor.stop_monitoring(batch_id)
+    _cleanup_private_album_bundle_staging(batch_id, batch)
+
+    # what the out-of-lock half reads: the m3u rows and this batch's tasks as
+    # they are right now, so it never has to touch download_tasks unlocked
+    m3u_tracks = []
+    tasks_snapshot = {}
+    for tid in queue:
+        task = download_tasks.get(tid)
+        if task is None:
+            continue
+        tasks_snapshot[tid] = dict(task)
+        if task.get('status') == 'completed':
+            ti = task.get('track_info', {})
+            artists = ti.get('artists', [])
+            artist_str = artists[0] if isinstance(artists, list) and artists else ''
+            if isinstance(artist_str, dict):
+                artist_str = artist_str.get('name', '')
+            m3u_tracks.append({
+                'name': ti.get('name', ''),
+                'artist': artist_str,
+                'duration_ms': ti.get('duration_ms', 0),
+            })
+
+    if is_music_batch(batch_id, batch):
+        # Mark that wishlist processing is starting (prevents premature cleanup)
+        batch['wishlist_processing_started'] = True
+    else:
+        batch['wishlist_processing_complete'] = True
+
+    return {'m3u_tracks': m3u_tracks, 'tasks_snapshot': tasks_snapshot}
+
+
+def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: LifecycleDeps,
+                                       outcome: dict, *, tag: str) -> None:
+    """The slow half of a completed batch: m3u regen, playlist folders, the
+    track-number repair hand-off and the album consistency pass. File i/o and
+    MusicBrainz lookups, so it runs OUTSIDE tasks_lock: it used to run inside
+    it, and every status poll and every other batch's completion callback
+    waited on a rate-limited MusicBrainz search and a tag rewrite of every
+    file in the album. Nothing here needs the lock: the batch is already
+    'complete' and the tasks it reads are a snapshot taken under it."""
+    tasks_snapshot = outcome.get('tasks_snapshot') or {}
+
+    # M3U REGENERATION: Regenerate M3U with real library paths now that
+    # all post-processing (tagging, moving, DB writes) is complete.
+    # The frontend M3U save may fire too early — this ensures paths resolve.
+    if deps.config_manager.get('m3u_export.enabled', False):
+        try:
+            if outcome.get('m3u_tracks'):
+                deps.regenerate_batch_m3u(batch, outcome['m3u_tracks'])
+        except Exception as m3u_err:
+            logger.error(f"[M3U] Error regenerating M3U on batch complete: {m3u_err}")
+
+    # PLAYLIST MATERIALIZE: one path-independent reconcile — drop this
+    # batch's newly-resolved tracks into the right Playlists/<name>/
+    # folders. Covers an organize-by-playlist download AND a late
+    # wishlist arrival (via each track's playlist provenance). Built
+    # from the batch's own captured paths — non-fatal, derived view.
+    try:
+        from core.playlists.materialize_service import reconcile_batch_playlists
+        from database.music_database import MusicDatabase
+        for _pl_name, _mat in reconcile_batch_playlists(MusicDatabase(), batch, tasks_snapshot, deps.config_manager):
+            logger.info(
+                f"[Playlist Folder] Rebuilt '{_mat.playlist_dir}': "
+                f"{_mat.linked} linked, {_mat.copied} copied, "
+                f"{_mat.unchanged} unchanged, {_mat.removed_stale} stale removed"
+                + (" (symlinks unsupported here → copied)" if _mat.fellback else "")
+            )
+    except Exception as _mat_err:
+        logger.error(f"[Playlist Folder] Materialize failed (non-fatal): {_mat_err}")
+
+    # REPAIR: Scan all album folders from this batch for track number issues
+    if deps.repair_worker:
+        deps.repair_worker.process_batch(batch_id)
+
+    # ALBUM CONSISTENCY: Picard-style post-batch pass — pick ONE MusicBrainz
+    # release and overwrite album-level tags on all files to guarantee consistency.
+    # This is the safety net: even if per-track MB lookups drifted (different cache
+    # keys, API hiccups), this pass forces every file to share the same release MBID,
+    # album artist ID, release group ID, etc. — preventing Navidrome album splits.
+    _cons_files = list(batch.get('_consistency_files') or [])
+    cons_tag = f"[Album Consistency{' V2' if 'V2' in tag else ''}]"
+    if batch.get('is_album_download') and _cons_files and len(_cons_files) >= 2:
+        _cons_album = batch.get('album_context', {})
+        _cons_artist = batch.get('artist_context', {})
+        _cons_album_name = _cons_album.get('name', '') if isinstance(_cons_album, dict) else ''
+        _cons_artist_name = _cons_artist.get('name', '') if isinstance(_cons_artist, dict) else ''
+        if _cons_album_name and _cons_artist_name:
+            try:
+                _cons_mb_svc = deps.mb_worker.mb_service if deps.mb_worker else None
+                if _cons_mb_svc and deps.config_manager.get('musicbrainz.embed_tags', True):
+                    from core.album_consistency import run_album_consistency
+                    from core.metadata.musicbrainz_tags import selected_release_id
+                    from core.metadata.common import get_file_lock
+                    _cons_result = run_album_consistency(
+                        file_infos=_cons_files,
+                        album_name=_cons_album_name,
+                        artist_name=_cons_artist_name,
+                        mb_service=_cons_mb_svc,
+                        total_discs=_cons_album.get('total_discs', 1),
+                        release_mbid=selected_release_id(_cons_album),
+                        file_lock_fn=get_file_lock,
+                    )
+                    if _cons_result.get('success'):
+                        logger.info(f"{cons_tag} {_cons_result['tags_written']}/{_cons_result['total_files']} files "
+                              f"harmonized to release {_cons_result.get('release_mbid', '')[:8]}...")
+                    elif _cons_result.get('error'):
+                        logger.error(f"{cons_tag} Skipped: {_cons_result['error']}")
+            except Exception as cons_err:
+                logger.error(f"{cons_tag} Failed (non-fatal): {cons_err}")
+    elif _cons_files:
+        # not an album batch (a search pick, a wishlist track, the one
+        # missing song): the file still has to join whatever album is
+        # already in its folder, or navidrome shows two albums
+        _adopt_loose_tracks(_cons_files, cons_tag, batch.get('album_context'))
 
 
 def on_download_completed(batch_id: str, task_id: str, success: bool, deps: LifecycleDeps) -> None:
@@ -531,6 +849,9 @@ def on_download_completed(batch_id: str, task_id: str, success: bool, deps: Life
 
 def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: LifecycleDeps) -> None:
     """Called when a download completes to start the next one in queue."""
+    batch_done = False
+    completion = None
+    is_auto_batch = False
     with tasks_lock:
         if batch_id not in download_batches:
             logger.warning(f"[Batch Manager] Batch {batch_id} not found for completed task {task_id}")
@@ -727,147 +1048,19 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                         "not marking complete, staged files kept for retry", batch_id)
                     return
 
-                # Mark batch as complete and set completion timestamp for auto-cleanup
-                batch['phase'] = 'complete'
-                batch['completion_time'] = time.time()  # Track when batch completed
+                completion = _mark_batch_complete(
+                    batch_id, batch, deps, queue=queue, finished_count=finished_count,
+                    tag='[Batch Manager]')
+            else:
+                logger.warning(f"[Batch Manager] Batch {batch_id} already marked complete - skipping duplicate processing")
 
-                # Record sync history completion
-                from database.music_database import MusicDatabase
-                record_sync_history_completion(MusicDatabase(), batch_id, batch)
+            batch_done = True
 
-                # Add activity for batch completion
-                playlist_name = batch.get('playlist_name', 'Unknown Playlist')
-                failed_count = len(batch.get('permanently_failed_tracks', []))
-                successful_downloads = finished_count - failed_count
-                add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
-
-                # Emit batch_complete event for automation engine (only if something downloaded)
-                if successful_downloads > 0:
-                    try:
-                        if deps.automation_engine:
-                            deps.automation_engine.emit('batch_complete', {
-                                'playlist_name': playlist_name,
-                                'total_tracks': str(len(queue)),
-                                'completed_tracks': str(successful_downloads),
-                                'failed_tracks': str(failed_count),
-                            })
-                    except Exception as e:
-                        logger.debug("batch_complete emit failed: %s", e)
-
-                # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
-                playlist_id = batch.get('playlist_id')
-                if playlist_id and playlist_id.startswith('youtube_'):
-                    url_hash = playlist_id.replace('youtube_', '')
-                    if url_hash in deps.youtube_playlist_states:
-                        deps.youtube_playlist_states[url_hash]['phase'] = 'download_complete'
-                        logger.info(f"Updated YouTube playlist {url_hash} to download_complete phase")
-
-                # Update Tidal playlist phase to 'download_complete' if this is a Tidal playlist
-                if playlist_id and playlist_id.startswith('tidal_'):
-                    tidal_playlist_id = playlist_id.replace('tidal_', '')
-                    if tidal_playlist_id in deps.tidal_discovery_states:
-                        deps.tidal_discovery_states[tidal_playlist_id]['phase'] = 'download_complete'
-                        logger.info(f"Updated Tidal playlist {tidal_playlist_id} to download_complete phase")
-
-                # Update Deezer playlist phase to 'download_complete' if this is a Deezer playlist
-                if playlist_id and playlist_id.startswith('deezer_'):
-                    deezer_playlist_id = playlist_id.replace('deezer_', '')
-                    if deezer_playlist_id in deps.deezer_discovery_states:
-                        deps.deezer_discovery_states[deezer_playlist_id]['phase'] = 'download_complete'
-                        logger.info(f"Updated Deezer playlist {deezer_playlist_id} to download_complete phase")
-
-                # Update Spotify Public playlist phase to 'download_complete' if this is a Spotify Public playlist
-                if playlist_id and playlist_id.startswith('spotify_public_'):
-                    spotify_public_url_hash = playlist_id.replace('spotify_public_', '')
-                    if spotify_public_url_hash in deps.spotify_public_discovery_states:
-                        deps.spotify_public_discovery_states[spotify_public_url_hash]['phase'] = 'download_complete'
-                        logger.info(f"Updated Spotify Public playlist {spotify_public_url_hash} to download_complete phase")
-
-                logger.info(f"[Batch Manager] Batch {batch_id} complete - stopping monitor")
-                deps.download_monitor.stop_monitoring(batch_id)
-                _cleanup_private_album_bundle_staging(batch_id, batch)
-
-                # M3U REGENERATION: Regenerate M3U with real library paths now that
-                # all post-processing (tagging, moving, DB writes) is complete.
-                # The frontend M3U save may fire too early — this ensures paths resolve.
-                if deps.config_manager.get('m3u_export.enabled', False):
-                    try:
-                        m3u_tracks = []
-                        for tid in queue:
-                            if tid in download_tasks and download_tasks[tid].get('status') == 'completed':
-                                ti = download_tasks[tid].get('track_info', {})
-                                artists = ti.get('artists', [])
-                                artist_str = artists[0] if isinstance(artists, list) and artists else ''
-                                if isinstance(artist_str, dict):
-                                    artist_str = artist_str.get('name', '')
-                                m3u_tracks.append({
-                                    'name': ti.get('name', ''),
-                                    'artist': artist_str,
-                                    'duration_ms': ti.get('duration_ms', 0),
-                                })
-                        if m3u_tracks:
-                            deps.regenerate_batch_m3u(batch, m3u_tracks)
-                    except Exception as m3u_err:
-                        logger.error(f"[M3U] Error regenerating M3U on batch complete: {m3u_err}")
-
-                # PLAYLIST MATERIALIZE: one path-independent reconcile — drop this
-                # batch's newly-resolved tracks into the right Playlists/<name>/
-                # folders. Covers an organize-by-playlist download AND a late
-                # wishlist arrival (via each track's playlist provenance). Built
-                # from the batch's own captured paths — non-fatal, derived view.
-                try:
-                    from core.playlists.materialize_service import reconcile_batch_playlists
-                    from database.music_database import MusicDatabase
-                    for _pl_name, _mat in reconcile_batch_playlists(MusicDatabase(), batch, download_tasks, deps.config_manager):
-                        logger.info(
-                            f"[Playlist Folder] Rebuilt '{_mat.playlist_dir}': "
-                            f"{_mat.linked} linked, {_mat.copied} copied, "
-                            f"{_mat.unchanged} unchanged, {_mat.removed_stale} stale removed"
-                            + (" (symlinks unsupported here → copied)" if _mat.fellback else "")
-                        )
-                except Exception as _mat_err:
-                    logger.error(f"[Playlist Folder] Materialize failed (non-fatal): {_mat_err}")
-
-                # REPAIR: Scan all album folders from this batch for track number issues
-                if deps.repair_worker:
-                    deps.repair_worker.process_batch(batch_id)
-
-                # ALBUM CONSISTENCY: Picard-style post-batch pass — pick ONE MusicBrainz
-                # release and overwrite album-level tags on all files to guarantee consistency.
-                # This is the safety net: even if per-track MB lookups drifted (different cache
-                # keys, API hiccups), this pass forces every file to share the same release MBID,
-                # album artist ID, release group ID, etc. — preventing Navidrome album splits.
-                _cons_files = batch.get('_consistency_files', [])
-                if batch.get('is_album_download') and _cons_files and len(_cons_files) >= 2:
-                    _cons_album = batch.get('album_context', {})
-                    _cons_artist = batch.get('artist_context', {})
-                    _cons_album_name = _cons_album.get('name', '') if isinstance(_cons_album, dict) else ''
-                    _cons_artist_name = _cons_artist.get('name', '') if isinstance(_cons_artist, dict) else ''
-                    if _cons_album_name and _cons_artist_name:
-                        try:
-                            _cons_mb_svc = deps.mb_worker.mb_service if deps.mb_worker else None
-                            if _cons_mb_svc and deps.config_manager.get('musicbrainz.embed_tags', True):
-                                from core.album_consistency import run_album_consistency
-                                from core.metadata.common import get_file_lock
-                                _cons_result = run_album_consistency(
-                                    file_infos=_cons_files,
-                                    album_name=_cons_album_name,
-                                    artist_name=_cons_artist_name,
-                                    mb_service=_cons_mb_svc,
-                                    total_discs=_cons_album.get('total_discs', 1),
-                                    file_lock_fn=get_file_lock,
-                                )
-                                if _cons_result.get('success'):
-                                    logger.info(f"[Album Consistency] {_cons_result['tags_written']}/{_cons_result['total_files']} files "
-                                          f"harmonized to release {_cons_result.get('release_mbid', '')[:8]}...")
-                                elif _cons_result.get('error'):
-                                    logger.error(f"[Album Consistency] Skipped: {_cons_result['error']}")
-                        except Exception as cons_err:
-                            logger.error(f"[Album Consistency] Failed (non-fatal): {cons_err}")
-
-                # Mark that wishlist processing is starting (prevents premature cleanup)
-                batch['wishlist_processing_started'] = True
-
+    if batch_done:
+        if completion is not None:
+            # the slow half runs with the lock released
+            _run_batch_completion_side_effects(batch_id, batch, deps, completion, tag='[Batch Manager]')
+            if is_music_batch(batch_id, batch):
                 # Process wishlist outside of the lock to prevent threading issues
                 if is_auto_batch:
                     # For auto-initiated batches, handle completion and schedule next cycle
@@ -876,9 +1069,8 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                     # For manual batches, use standard wishlist processing
                     deps.submit_failed_to_wishlist(batch_id)
             else:
-                logger.warning(f"[Batch Manager] Batch {batch_id} already marked complete - skipping duplicate processing")
-
-            return  # Don't start next batch if we're done
+                logger.info(f"[Batch Manager] Skipping wishlist processing for non-music batch {batch_id}")
+        return  # Don't start next batch if we're done
 
     # Start next downloads in queue
     logger.info(f"[Batch Manager] Starting next batch for {batch_id}")
@@ -953,6 +1145,7 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
             logger.warning(f"[Completion Check V2] Batch {batch_id}: tasks_started={all_tasks_started}, workers={no_active_workers}, finished={finished_count}/{len(queue)}, retrying={retrying_count}")
 
             is_auto_batch = False
+            completion = None
             if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
                 # FIXED: Ensure batch is not already marked as complete to prevent duplicate processing
                 if batch.get('phase') != 'complete':
@@ -972,127 +1165,30 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
                             "retry", batch_id)
                         return False
 
-                    # Mark batch as complete and set completion timestamp for auto-cleanup
-                    batch['phase'] = 'complete'
-                    batch['completion_time'] = time.time()  # Track when batch completed
-
-                    # Add activity for batch completion
-                    playlist_name = batch.get('playlist_name', 'Unknown Playlist')
-                    failed_count = len(batch.get('permanently_failed_tracks', []))
-                    successful_downloads = finished_count - failed_count
-                    add_activity_item("", "Download Batch Complete", f"'{playlist_name}' - {successful_downloads} tracks downloaded", "Now")
-
-                    # Emit batch_complete event for automation engine (only if something downloaded)
-                    if successful_downloads > 0:
-                        try:
-                            if deps.automation_engine:
-                                deps.automation_engine.emit('batch_complete', {
-                                    'playlist_name': playlist_name,
-                                    'total_tracks': str(len(queue)),
-                                    'completed_tracks': str(successful_downloads),
-                                    'failed_tracks': str(failed_count),
-                                })
-                        except Exception as e:
-                            logger.debug("batch_complete emit failed: %s", e)
+                    completion = _mark_batch_complete(
+                        batch_id, batch, deps, queue=queue, finished_count=finished_count,
+                        tag='[Completion Check V2]')
                 else:
                     logger.warning(f"[Completion Check V2] Batch {batch_id} already marked complete - skipping duplicate processing")
                     return True  # Already complete
 
-                # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
-                playlist_id = batch.get('playlist_id')
-                if playlist_id and playlist_id.startswith('youtube_'):
-                    url_hash = playlist_id.replace('youtube_', '')
-                    if url_hash in deps.youtube_playlist_states:
-                        deps.youtube_playlist_states[url_hash]['phase'] = 'download_complete'
-                        logger.info(f"[Completion Check V2] Updated YouTube playlist {url_hash} to download_complete phase")
-
-                # Update Tidal playlist phase to 'download_complete' if this is a Tidal playlist
-                if playlist_id and playlist_id.startswith('tidal_'):
-                    tidal_playlist_id = playlist_id.replace('tidal_', '')
-                    if tidal_playlist_id in deps.tidal_discovery_states:
-                        deps.tidal_discovery_states[tidal_playlist_id]['phase'] = 'download_complete'
-                        logger.info(f"[Completion Check V2] Updated Tidal playlist {tidal_playlist_id} to download_complete phase")
-
-                # Update Deezer playlist phase to 'download_complete' if this is a Deezer playlist
-                if playlist_id and playlist_id.startswith('deezer_'):
-                    deezer_playlist_id = playlist_id.replace('deezer_', '')
-                    if deezer_playlist_id in deps.deezer_discovery_states:
-                        deps.deezer_discovery_states[deezer_playlist_id]['phase'] = 'download_complete'
-                        logger.info(f"[Completion Check V2] Updated Deezer playlist {deezer_playlist_id} to download_complete phase")
-
-                # Update Spotify Public playlist phase to 'download_complete' if this is a Spotify Public playlist
-                if playlist_id and playlist_id.startswith('spotify_public_'):
-                    spotify_public_url_hash = playlist_id.replace('spotify_public_', '')
-                    if spotify_public_url_hash in deps.spotify_public_discovery_states:
-                        deps.spotify_public_discovery_states[spotify_public_url_hash]['phase'] = 'download_complete'
-                        logger.info(f"[Completion Check V2] Updated Spotify Public playlist {spotify_public_url_hash} to download_complete phase")
-
-                logger.info(f"[Completion Check V2] Batch {batch_id} complete - stopping monitor")
-                deps.download_monitor.stop_monitoring(batch_id)
-                _cleanup_private_album_bundle_staging(batch_id, batch)
-
-                # PLAYLIST MATERIALIZE: same reconcile as the primary completion path
-                # (on_download_completed). Monitor-detected downloads complete via THIS
-                # V2 path, so the reconcile must run here too or playlist folders never
-                # get built for them. Path-independent, non-fatal, derived view.
-                try:
-                    from core.playlists.materialize_service import reconcile_batch_playlists
-                    from database.music_database import MusicDatabase
-                    for _pl_name, _mat in reconcile_batch_playlists(MusicDatabase(), batch, download_tasks, deps.config_manager):
-                        logger.info(
-                            f"[Playlist Folder] Rebuilt '{_mat.playlist_dir}': "
-                            f"{_mat.linked} linked, {_mat.copied} copied, "
-                            f"{_mat.unchanged} unchanged, {_mat.removed_stale} stale removed"
-                            + (" (symlinks unsupported here → copied)" if _mat.fellback else "")
-                        )
-                except Exception as _mat_err:
-                    logger.error(f"[Playlist Folder] Materialize failed (non-fatal): {_mat_err}")
-
-                # REPAIR: Scan all album folders from this batch for track number issues
-                if deps.repair_worker:
-                    deps.repair_worker.process_batch(batch_id)
-
-                # ALBUM CONSISTENCY: Same Picard-style pass as the primary completion path
-                _cons_files = batch.get('_consistency_files', [])
-                if batch.get('is_album_download') and _cons_files and len(_cons_files) >= 2:
-                    _cons_album = batch.get('album_context', {})
-                    _cons_artist = batch.get('artist_context', {})
-                    _cons_album_name = _cons_album.get('name', '') if isinstance(_cons_album, dict) else ''
-                    _cons_artist_name = _cons_artist.get('name', '') if isinstance(_cons_artist, dict) else ''
-                    if _cons_album_name and _cons_artist_name:
-                        try:
-                            _cons_mb_svc = deps.mb_worker.mb_service if deps.mb_worker else None
-                            if _cons_mb_svc and deps.config_manager.get('musicbrainz.embed_tags', True):
-                                from core.album_consistency import run_album_consistency
-                                from core.metadata.common import get_file_lock
-                                _cons_result = run_album_consistency(
-                                    file_infos=_cons_files,
-                                    album_name=_cons_album_name,
-                                    artist_name=_cons_artist_name,
-                                    mb_service=_cons_mb_svc,
-                                    total_discs=_cons_album.get('total_discs', 1),
-                                    file_lock_fn=get_file_lock,
-                                )
-                                if _cons_result.get('success'):
-                                    logger.info(f"[Album Consistency V2] {_cons_result['tags_written']}/{_cons_result['total_files']} files "
-                                          f"harmonized to release {_cons_result.get('release_mbid', '')[:8]}...")
-                                elif _cons_result.get('error'):
-                                    logger.error(f"[Album Consistency V2] Skipped: {_cons_result['error']}")
-                        except Exception as cons_err:
-                            logger.error(f"[Album Consistency V2] Failed (non-fatal): {cons_err}")
-
         # Process wishlist outside of the lock to prevent threading issues
         if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
+            # the slow half runs with the lock released
+            _run_batch_completion_side_effects(batch_id, batch, deps, completion, tag='[Completion Check V2]')
             # Call wishlist processing outside the lock — DIRECT (synchronous) call
             # to match original v2 behavior. The non-v2 path (on_download_completed)
             # uses the async submit_* deps; v2 calls directly because v2 itself runs
             # from a context where blocking is acceptable.
-            if is_auto_batch:
-                logger.info("[Completion Check V2] Processing auto-initiated batch completion")
-                deps.process_failed_to_wishlist_with_auto_completion(batch_id)
+            if is_music_batch(batch_id, batch):
+                if is_auto_batch:
+                    logger.info("[Completion Check V2] Processing auto-initiated batch completion")
+                    deps.process_failed_to_wishlist_with_auto_completion(batch_id)
+                else:
+                    logger.info("[Completion Check V2] Processing regular batch completion")
+                    deps.process_failed_to_wishlist(batch_id)
             else:
-                logger.info("[Completion Check V2] Processing regular batch completion")
-                deps.process_failed_to_wishlist(batch_id)
+                logger.info(f"[Completion Check V2] Skipping wishlist processing for non-music batch {batch_id}")
 
             return True  # Batch was completed
         else:

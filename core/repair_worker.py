@@ -99,7 +99,7 @@ FINDING_TYPE_META = {
     'acoustid_mismatch':        {'label': 'AcoustID Mismatch', 'verb': 'Re-tag'},
     'quality_upgrade':          {'label': 'Quality Upgrades', 'verb': 'Upgrade'},
     'missing_discography_track':{'label': 'Missing Discography', 'verb': 'Add to Wishlist'},
-    'library_retag':            {'label': 'Library Retag', 'verb': 'Apply Tags'},
+    'library_retag':            {'label': 'Library Re-tag', 'verb': 'Apply Tags'},
     'short_preview_track':      {'label': 'Preview Clips', 'verb': 'Re-download'},
     'corrupt_audio':            {'label': 'Corrupt Audio', 'verb': 'Re-download'},
     'canonical_version':        {'label': 'Canonical Version', 'verb': 'Pin Version'},
@@ -936,7 +936,15 @@ class RepairWorker:
             should_stop=lambda: self.should_stop or self._cancel_current_job.is_set(),
             stop_event=self._stop_event,
             is_paused=(lambda: False) if forced else (lambda: not self.enabled),
-            update_progress=self._update_progress,
+            # update_progress feeds the Tools page; report_progress feeds
+            # the notification centre's card. They were two separate calls a
+            # job had to remember to make BOTH of, and three jobs only ever
+            # made the first — so Library Re-tag showed a live count on one
+            # screen and a bar frozen at 0% on the other (#1231). Reporting
+            # one now feeds the other, so a job cannot tell them different
+            # stories and a new job gets a working bar for free.
+            update_progress=lambda scanned, total: self._update_progress(
+                scanned, total, report=_report_progress),
             report_progress=_report_progress,
         )
 
@@ -1032,30 +1040,67 @@ class RepairWorker:
             remaining -= chunk
         return self._stop_event.is_set()
 
-    def run_job_now(self, job_id: str):
+    def run_job_now(self, job_id: str, respect_enabled: bool = False) -> bool:
         """Queue a job for immediate execution by the main worker loop.
 
         Uses a thread-safe queue instead of spawning a separate thread
         to avoid race conditions with the main loop's _run_job().
+
+        Returns True when the job is queued (or already waiting), the same
+        contract as the video worker's run_job_now. it never returned
+        ANYTHING, so the quality-check automation read None as "library
+        worker unavailable" on every run while the scan it triggered ran
+        fine behind its back (#1192).
+
+        respect_enabled is for NON-HUMAN callers. a person clicking Run Now
+        means it, toggle or not, so that stays the default. an automation is
+        different: wishx turned Quality Upgrade Finder off to free up
+        resources and it kept running anyway, because his import automation
+        force-queued it on every scan. a weekly job ran 12 times in two days
+        (#1207). the toggle is the user's statement about resources, so a
+        background trigger has to honour it.
         """
         self._ensure_jobs_loaded()
         if job_id not in self._jobs:
             logger.warning("Unknown job: %s", job_id)
-            return
+            return False
+
+        if respect_enabled:
+            try:
+                if not self.get_job_config(job_id).get('enabled', True):
+                    logger.info("Job %s is disabled, not running it for a background trigger", job_id)
+                    return False
+            except Exception:
+                # config unreadable, fall through and run. refusing on a bad
+                # read would silently stop scheduled work.
+                logger.debug("Could not read config for %s, allowing the run", job_id, exc_info=True)
 
         with self._force_run_lock:
             if job_id not in self._force_run_queue:
                 self._force_run_queue.append(job_id)
                 logger.info("Job %s queued for immediate run", job_id)
+        return True
 
-    def _update_progress(self, scanned: int, total: int):
-        """Callback for jobs to report progress."""
+    def _update_progress(self, scanned: int, total: int, report=None):
+        """Callback for jobs to report progress.
+
+        ``report`` is the same job's rich callback. Forwarding here means a job
+        that calls update_progress in its loop gets the notification card moving
+        too, without having to remember a second call — which is exactly what
+        three jobs forgot (#1231).
+        """
         percent = round(scanned / total * 100) if total > 0 else 0
         self._current_progress = {
             'scanned': scanned,
             'total': total,
             'percent': percent,
         }
+        if report is not None:
+            try:
+                report(scanned=scanned, total=total)
+            except Exception as e:
+                # Progress reporting must never be able to fail a job.
+                logger.debug("progress forward failed: %s", e)
 
     # ------------------------------------------------------------------
     # Findings
@@ -1200,11 +1245,53 @@ class RepairWorker:
     # Sort keys the inbox offers. Severity-first is the triage default; a flat
     # newest-first list buries three corrupt files under four hundred missing
     # lyrics. Whitelisted rather than interpolated — this lands in ORDER BY.
+    # How bad a file actually is, as a number, straight off the finding.
+    #
+    # Severity cannot answer this: the quality scanner only ever emits
+    # 'warning' (broken audio) or 'info' (below profile), so EVERY upgradeable
+    # track tied at 'info' and the sort fell through to created_at. That is why
+    # sorting by severity handed back 320, then 192, then 256 - it was showing
+    # scan order and calling it severity.
+    #
+    # This is AudioQuality.tier_score() transcribed into SQL, branch for branch,
+    # and a test asserts the two order an identical set identically. tier_score
+    # has TWO branches and an earlier flat formula here matched neither: lossless
+    # (flac/wav) scores on sample rate and bit depth and ignores bitrate, while
+    # everything else scores on bitrate capped at 320kbps. Inventing a second
+    # definition of "better audio" put ALAC on the wrong side of FLAC and sent
+    # DSD to the top of the list.
+    #
+    # Computed from current_format/current_bitrate, which every quality finding
+    # has already stored, so old findings sort correctly without a rescan.
+    _QUALITY_SCORE_SQL = (
+        "(CASE WHEN lower(COALESCE(json_extract(details_json, '$.current_format'), '')) "
+        "        IN ('flac', 'alac', 'wav') THEN "
+        "   (CASE lower(json_extract(details_json, '$.current_format')) "
+        "      WHEN 'flac' THEN 100 WHEN 'alac' THEN 98 ELSE 95 END) "
+        "   + MIN(COALESCE(json_extract(details_json, '$.current_sample_rate'), 44100) "
+        "         / 192000.0, 1.0) * 20 "
+        "   + MAX(COALESCE(json_extract(details_json, '$.current_bit_depth'), 16) - 16, 0) "
+        "         / 8.0 * 10 "
+        "ELSE "
+        "   (CASE lower(COALESCE(json_extract(details_json, '$.current_format'), '')) "
+        "      WHEN 'dsf' THEN 102 WHEN 'ogg' THEN 70 "
+        "      WHEN 'opus' THEN 65 WHEN 'aac' THEN 60 WHEN 'mp3' THEN 50 "
+        "      WHEN 'wma' THEN 30 ELSE 10 END) "
+        "   + MIN(COALESCE(json_extract(details_json, '$.current_bitrate'), 0) / 320.0, 1.0) * 10 "
+        "END)"
+    )
+
     _FINDING_SORTS = {
         'newest': 'created_at DESC',
         'oldest': 'created_at ASC',
+        # Severity still leads - a broken file outranks a merely-lossy one - but
+        # within a band the worst quality now comes first instead of scan order.
         'severity': ("CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 "
-                     "ELSE 2 END, created_at DESC"),
+                     "ELSE 2 END, " + _QUALITY_SCORE_SQL + " ASC, created_at DESC"),
+        # Worst audio first, ignoring severity entirely. What someone working
+        # through an upgrade backlog actually wants: fix the 128s before the 320s.
+        'quality': (_QUALITY_SCORE_SQL + " ASC, created_at DESC"),
+        'quality_desc': (_QUALITY_SCORE_SQL + " DESC, created_at DESC"),
         'path': 'file_path IS NULL, file_path ASC, created_at DESC',
     }
 
@@ -1346,6 +1433,105 @@ class RepairWorker:
         finally:
             if conn:
                 conn.close()
+
+    # Which details field names the album / artist for a grouped view. Only
+    # the quality jobs write these today, so a type that has never heard of an
+    # album simply produces no groups rather than one giant "Unknown" bucket.
+    # Jobs did not agree on a spelling: 'artist' (34 uses), 'artist_name' (7)
+    # and 'expected_artist' (2); 'album' (29), 'album_title' (15), 'album_name'
+    # (1). Reading only the quality scanner's pair would have made this view
+    # quality-only by accident, when fourteen job types record the same thing.
+    _ARTIST_KEY = ("COALESCE(json_extract(details_json, '$.expected_artist'), "
+                   "json_extract(details_json, '$.artist'), "
+                   "json_extract(details_json, '$.artist_name'))")
+    _ALBUM_KEY = ("COALESCE(json_extract(details_json, '$.album_title'), "
+                  "json_extract(details_json, '$.album'), "
+                  "json_extract(details_json, '$.album_name'))")
+
+    _GROUP_KEYS = {
+        'album': (_ARTIST_KEY, _ALBUM_KEY),
+        'artist': (_ARTIST_KEY, "NULL"),
+    }
+
+    def get_finding_albums(self, group_by: str = 'album', job_id: str = None,
+                           status: str = 'pending', finding_type: str = None,
+                           q: str = None, limit: int = 200) -> List[dict]:
+        """Findings folded to one row per ALBUM (or per ARTIST), with artwork.
+
+        A flat list of 40,000 upgradeable tracks is not reviewable. Nobody
+        decides one track at a time whether to re-acquire it; they decide per
+        album ("re-rip this one properly") or per artist ("everything by them
+        is a bad rip"). This returns that unit, with the counts and the artwork
+        already on the finding, so the UI never has to fan out per row.
+
+        Ordered worst-audio-first: the album carrying the lowest-quality file
+        leads, because that is the one most worth fixing. Ties break on size,
+        so a 12-track 128kbps album outranks a single stray.
+
+        Rows with no album/artist recorded are dropped rather than collected
+        into an "Unknown" pile - they would be the biggest group on the page
+        and mean nothing.
+        """
+        artist_expr, album_expr = self._GROUP_KEYS.get(
+            group_by, self._GROUP_KEYS['album'])
+        where, params = self._findings_filter(
+            job_id=job_id, status=status, finding_type=finding_type, q=q)
+        # the group key itself must exist, or the row is not groupable
+        guard = f"{artist_expr} IS NOT NULL AND {artist_expr} <> ''"
+        if group_by == 'album':
+            guard += f" AND {album_expr} IS NOT NULL AND {album_expr} <> ''"
+        where = f"{where} AND {guard}" if where else f"WHERE {guard}"
+
+        score = self._QUALITY_SCORE_SQL
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            rows = conn.execute(f"""
+                SELECT {artist_expr}                        AS artist,
+                       {album_expr}                         AS album,
+                       COUNT(*)                             AS count,
+                       MIN({score})                         AS worst_score,
+                       MAX({score})                         AS best_score,
+                       MIN(printf('%012.4f', {score}) || '|' ||
+                           COALESCE(json_extract(details_json, '$.current_quality'), ''))
+                                                            AS _worst_label,
+                       MAX(printf('%012.4f', {score}) || '|' ||
+                           COALESCE(json_extract(details_json, '$.current_quality'), ''))
+                                                            AS _best_label,
+                       MAX(json_extract(details_json, '$.album_thumb_url'))  AS album_thumb_url,
+                       MAX(json_extract(details_json, '$.artist_thumb_url')) AS artist_thumb_url,
+                       MAX(json_extract(details_json, '$.artist_id'))        AS artist_id,
+                       MIN(created_at)                      AS first_seen,
+                       MAX(created_at)                      AS last_seen
+                FROM repair_findings
+                {where}
+                GROUP BY artist, album
+                ORDER BY worst_score ASC, count DESC, artist ASC
+                LIMIT ?
+            """, (*params, max(1, int(limit)))).fetchall()
+        except Exception as e:
+            logger.error("Error grouping findings by %s: %s", group_by, e, exc_info=True)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+        out = []
+        for r in rows:
+            d = dict(r)
+            # The label the user reads comes from the worst member, resolved
+            # separately so the SQL stays a pure aggregate.
+            d['group_by'] = group_by
+            d['key'] = f"{d.get('artist') or ''}\u0000{d.get('album') or ''}"
+            # printf-padded so the string MIN/MAX above order numerically; the
+            # label rides along so the worst member names itself without a
+            # second query per group.
+            for src, dest in (('_worst_label', 'worst_quality'),
+                              ('_best_label', 'best_quality')):
+                raw_label = d.pop(src, None) or ''
+                d[dest] = raw_label.split('|', 1)[1] if '|' in raw_label else ''
+            out.append(d)
+        return out
 
     def get_finding_groups(self) -> List[dict]:
         """One row per finding TYPE — the unit the inbox works in.
@@ -3274,6 +3460,41 @@ class RepairWorker:
         if self._config_manager:
             download_folder = self._config_manager.get('soulseek.download_path', '')
         transfer_norm = os.path.normpath(self.transfer_folder)
+
+        # Never move the file the keeper points at. Two rows can carry the same
+        # path (#1210), and when they did, "remove the other copy" moved the only
+        # file there was and left the kept row pointing at nothing. The detector
+        # no longer produces those groups, but this is the layer that actually
+        # deletes, so it checks for itself.
+        keep_resolved = ''
+        if best.get('file_path'):
+            keep_resolved = _resolve_file_path(
+                best['file_path'], self.transfer_folder, download_folder,
+                config_manager=self._config_manager) or ''
+        if not keep_resolved:
+            # No usable path for the copy we are keeping, so there is no way to
+            # prove the files below aren't that same copy. Refuse rather than
+            # guess: a duplicate left on disk is fixable, the only copy of a
+            # song is not.
+            return {
+                'success': False,
+                'error': ('Could not resolve the file for the copy being kept, so no '
+                          'duplicate was removed. Check Settings > Library > Music Paths.'),
+                'files_deleted': 0,
+                'files_failed': 0,
+            }
+
+        def _is_keeper_file(candidate):
+            if not keep_resolved or not candidate:
+                return False
+            try:
+                if os.path.exists(keep_resolved) and os.path.exists(candidate):
+                    return os.path.samefile(keep_resolved, candidate)
+            except OSError:
+                pass
+            return (os.path.normcase(os.path.normpath(candidate))
+                    == os.path.normcase(os.path.normpath(keep_resolved)))
+
         from core.repair_jobs.base import deleted_quarantine_root
         deleted_root = deleted_quarantine_root(self.transfer_folder)
         files_deleted = 0
@@ -3307,6 +3528,15 @@ class RepairWorker:
                     "did not resolve to an existing file). DB row kept and file left "
                     "on disk — check your Docker volume mapping and Settings > Library "
                     "> Music Paths.%s", fpath, navidrome_hint)
+                continue
+            if _is_keeper_file(resolved):
+                # Same file as the copy being kept: drop the extra database row
+                # so the phantom duplicate stops coming back, but leave the file
+                # exactly where it is.
+                logger.warning(
+                    "Duplicate cleanup: %r is the same file as the copy being kept. "
+                    "Removing the extra database row only, the file is untouched.", resolved)
+                db_remove_ids.append(tid)
                 continue
             try:
                 dest = self._quarantine_dest(resolved, deleted_root)
@@ -4023,10 +4253,13 @@ class RepairWorker:
                 file_changed = False
                 for field, canonical in canonical_map.items():
                     current = _read_tag(audio, field)
-                    if current and current != canonical:
+                    # an empty tag is a mismatch too: navidrome keys on the
+                    # release id, so a file without one splits off exactly
+                    # like a file with the wrong one
+                    if (current or '') != canonical:
                         if _write_tag(audio, field, canonical):
                             file_changed = True
-                            changes.append(f'{field}: "{current}" → "{canonical}" in {os.path.basename(resolved)}')
+                            changes.append(f'{field}: "{current or "(missing)"}" → "{canonical}" in {os.path.basename(resolved)}')
 
                 if file_changed:
                     # Atomic + audio-integrity-verified save (#819/#1000): never
@@ -4932,12 +5165,33 @@ class RepairWorker:
         if not file_path:
             return {'success': False, 'error': 'No file path associated with this finding'}
 
-        # Read fresh from current settings — not from finding details
+        # Read the track's assigned quality profile LIVE. Finding details only
+        # carry its id; codec/bitrate/delete-original may have changed since
+        # the scan. Fall back to legacy globals for old findings/installations.
         codec = 'mp3'
         bitrate = '320'
-        if self._config_manager:
+        delete_original = False
+        profile = None
+        profile_id = details.get('quality_profile_id') if isinstance(details, dict) else None
+        try:
+            from core.quality.selection import load_profile_by_id
+            # A NULL assignment deliberately means "use the current default".
+            # load_profile_by_id(None) performs that live resolution, so a
+            # default-profile change between scan and apply is respected.
+            profile = load_profile_by_id(profile_id)
+        except Exception as e:
+            logger.debug("Could not resolve lossy-converter profile %r: %s", profile_id, e)
+        if isinstance(profile, dict) and 'lossy_copy_enabled' in profile:
+            if not profile.get('lossy_copy_enabled'):
+                return {'success': False, 'error': 'Lossy Copy is disabled for this track profile'}
+            codec = str(profile.get('lossy_copy_codec') or 'mp3').lower()
+            bitrate = str(profile.get('lossy_copy_bitrate') or '320')
+            delete_original = bool(profile.get('lossy_copy_delete_original'))
+        elif self._config_manager:
             codec = self._config_manager.get('lossy_copy.codec', 'mp3').lower()
             bitrate = self._config_manager.get('lossy_copy.bitrate', '320')
+            delete_original = bool(
+                self._config_manager.get('lossy_copy.delete_original', False))
         # Opus max per-channel bitrate is 256kbps — cap to avoid encoding failures
         if codec == 'opus' and int(bitrate) > 256:
             bitrate = '256'
@@ -4972,6 +5226,9 @@ class RepairWorker:
 
         if not os.path.exists(resolved):
             return {'success': False, 'error': f'Source file not found: {file_path}'}
+
+        from core.imports.file_ops import probe_audio_quality
+        acquired_quality = probe_audio_quality(resolved)
 
         out_path = os.path.splitext(resolved)[0] + out_ext
         # Safety invariant: ffmpeg runs with -y, so refuse to convert a file onto
@@ -5063,13 +5320,6 @@ class RepairWorker:
                 except Exception as e:
                     logger.debug("Failed to embed cover art in lossy copy: %s", e)
 
-            # Blasphemy Mode — uses the job's own setting, not the global lossy_copy one
-            delete_original = False
-            if self._config_manager:
-                job_settings = self._config_manager.get('repair.jobs.lossy_converter.settings', {})
-                if isinstance(job_settings, dict):
-                    delete_original = job_settings.get('delete_original', False)
-
             if delete_original:
                 try:
                     from mutagen import File as MutagenFile
@@ -5081,9 +5331,23 @@ class RepairWorker:
                         try:
                             conn = self.db._get_connection()
                             cursor = conn.cursor()
+                            from core.quality.retention import quality_json, transforms_json
+                            output_quality = probe_audio_quality(out_path)
+                            retention_json = transforms_json([{
+                                'type': 'lossy_copy',
+                                'source_replaced': True,
+                                'codec': codec,
+                                'bitrate': bitrate,
+                                'output_quality': (
+                                    output_quality.to_dict() if output_quality else None),
+                            }])
                             cursor.execute(
-                                "UPDATE tracks SET file_path = ? WHERE id = ?",
-                                (new_db_path, entity_id)
+                                """UPDATE tracks
+                                      SET file_path=?, acquired_quality_json=?,
+                                          retention_json=?, updated_at=CURRENT_TIMESTAMP
+                                    WHERE id=?""",
+                                (new_db_path, quality_json(acquired_quality),
+                                 retention_json, entity_id)
                             )
                             conn.commit()
                             conn.close()

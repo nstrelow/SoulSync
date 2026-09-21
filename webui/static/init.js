@@ -497,6 +497,7 @@ bootstrapServerAppearanceSettings();
 
 // ── Profile System ─────────────────────────────────────────────
 let currentProfile = null;
+let profileLoginMode = false;
 const PROFILE_CONTEXT_CHANGED_EVENT = 'ss:webui-profile-context-changed';
 
 function notifyProfileContextChanged() {
@@ -611,6 +612,7 @@ async function initProfileSystem() {
         // Check if a session already has a profile selected
         const currentRes = await fetch('/api/profiles/current');
         const currentData = await currentRes.json();
+        profileLoginMode = !!currentData.login_mode;
         // Login mode: show the sign-in screen and defer everything else until
         // the user authenticates.
         if (currentData.login_required) {
@@ -1242,8 +1244,10 @@ async function handleProfileClick(profile) {
         profileCount = (d.profiles || []).length;
     } catch (e) { }
 
-    if (profile.has_pin && profileCount > 1) {
-        showPinDialog(profile);
+    if (profileLoginMode && currentProfile && profile.id !== currentProfile.id) {
+        showPinDialog(profile, 'password');
+    } else if (profile.has_pin && profileCount > 1) {
+        showPinDialog(profile, 'pin');
     } else {
         const wasSwitching = !!currentProfile;
         await selectProfile(profile.id);
@@ -1256,7 +1260,7 @@ async function handleProfileClick(profile) {
     }
 }
 
-function showPinDialog(profile) {
+function showPinDialog(profile, mode = 'pin') {
     const dialog = document.getElementById('profile-pin-dialog');
     const avatar = document.getElementById('profile-pin-avatar');
     const nameEl = document.getElementById('profile-pin-name');
@@ -1282,17 +1286,25 @@ function showPinDialog(profile) {
     dialog.style.display = 'flex';
     setTimeout(() => input.focus(), 100);
 
+    const isPasswordMode = mode === 'password';
+    input.placeholder = isPasswordMode ? 'Password' : 'Enter PIN';
+    input.maxLength = isPasswordMode ? 200 : 6;
+    const forgot = document.getElementById('profile-pin-forgot');
+    if (forgot) forgot.style.display = isPasswordMode ? 'none' : '';
+
     const wasSwitching = !!currentProfile;
     const handleSubmit = async () => {
-        const pin = input.value;
-        if (!pin) return;
+        const secret = input.value;
+        if (!secret) return;
         submit.disabled = true;
         submit.textContent = 'Verifying...';
         try {
             const res = await fetch('/api/profiles/select', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ profile_id: profile.id, pin })
+                body: JSON.stringify(isPasswordMode
+                    ? { profile_id: profile.id, password: secret }
+                    : { profile_id: profile.id, pin: secret })
             });
             const data = await res.json();
             if (data.success) {
@@ -1307,7 +1319,7 @@ function showPinDialog(profile) {
                 initApp();
                 return;
             } else {
-                errorEl.textContent = data.error || 'Invalid PIN';
+                errorEl.textContent = data.error || (isPasswordMode ? 'Invalid password' : 'Invalid PIN');
                 errorEl.style.display = '';
                 input.value = '';
                 input.focus();
@@ -1656,19 +1668,35 @@ async function renderPersonalSettingsServerLibrary(container, profileData) {
     let users = [];
     const currentLib = profileData || {};
 
+    // the ACTIVE server decides which card this is. it used to probe plex
+    // first and take it whenever plex was merely configured, so a jellyfin
+    // (or navidrome) install with a plex token still in settings always
+    // got the plex card here (#1265).
+    let activeServer = '';
     try {
-        // Try each server type to find the active one
-        const plexRes = await fetch('/api/plex/music-libraries');
-        if (plexRes.ok) {
-            const plexData = await plexRes.json();
-            if (plexData.libraries && plexData.libraries.length > 0) {
-                serverType = 'plex';
-                libraries = plexData.libraries;
-            }
+        const activeRes = await fetch('/api/profiles/me/active-sources');
+        if (activeRes.ok) {
+            const active = await activeRes.json();
+            activeServer = (active && active.server && active.server.active) || '';
         }
     } catch (e) { }
 
-    if (serverType === 'none') {
+    if (activeServer === 'navidrome') {
+        serverType = 'navidrome';
+    } else if (activeServer === 'plex' || activeServer === '') {
+        try {
+            const plexRes = await fetch('/api/plex/music-libraries');
+            if (plexRes.ok) {
+                const plexData = await plexRes.json();
+                if (plexData.libraries && plexData.libraries.length > 0) {
+                    serverType = 'plex';
+                    libraries = plexData.libraries;
+                }
+            }
+        } catch (e) { }
+    }
+
+    if (serverType === 'none' && (activeServer === 'jellyfin' || activeServer === 'emby' || activeServer === '')) {
         try {
             const jellyRes = await fetch('/api/jellyfin/music-libraries');
             if (jellyRes.ok) {
@@ -1691,6 +1719,32 @@ async function renderPersonalSettingsServerLibrary(container, profileData) {
                 <div class="ps-help-text">No media server connected. Ask your admin to configure Plex, Jellyfin, or Navidrome in Settings.</div>
             </div>
         `;
+    } else if (serverType === 'navidrome') {
+        const savedUser = currentLib.navidrome_username || '';
+        section.innerHTML = `
+            <div class="ps-section">
+                <div class="ps-section-header">
+                    <h4 class="ps-section-title">Navidrome</h4>
+                    <span class="ps-connection-badge ${savedUser ? 'connected' : 'disconnected'}">
+                        <span class="ps-connection-dot"></span>
+                        ${savedUser ? escapeHtml(savedUser) : 'App account'}
+                    </span>
+                </div>
+                <div class="ps-help-text" style="margin-bottom:12px;">Log in with your own Navidrome user and the playlists you sync will belong to you in Navidrome. Without a login they belong to the app's account.</div>
+                <div class="ps-form-group">
+                    <label>Navidrome username</label>
+                    <input type="text" id="ps-navidrome-username" value="${escapeHtml(savedUser)}" autocomplete="off">
+                </div>
+                <div class="ps-form-group">
+                    <label>Navidrome password</label>
+                    <input type="password" id="ps-navidrome-password" placeholder="${savedUser ? 'Saved' : ''}" autocomplete="new-password">
+                </div>
+                <div class="ps-actions">
+                    <button class="ps-btn ps-btn-primary" onclick="savePersonalNavidromeLogin()">Save</button>
+                    ${savedUser ? '<button class="ps-btn" onclick="clearPersonalNavidromeLogin()">Use app account</button>' : ''}
+                </div>
+            </div>
+        `;
     } else if (serverType === 'plex') {
         const selectedLib = currentLib.plex_library_id || '';
         const optionsHtml = libraries.map(lib => {
@@ -1699,7 +1753,46 @@ async function renderPersonalSettingsServerLibrary(container, profileData) {
             return `<option value="${escapeHtml(val)}" ${val === selectedLib ? 'selected' : ''}>${escapeHtml(val)}</option>`;
         }).join('');
 
+        // who this profile is on plex (#1265): the playlists it syncs belong
+        // to that plex home user. linking takes the user's plex profile pin
+        // once when they have one; it is used for that one switch, not kept.
+        const linkedUser = currentLib.plex_home_user_title || '';
+        let homeUsers = [];
+        try {
+            const huRes = await fetch('/api/profiles/me/plex-home-users');
+            if (huRes.ok) homeUsers = (await huRes.json()).users || [];
+        } catch (e) { }
+        const homeUserOpts = homeUsers.map(u =>
+            `<option value="${escapeHtml(u.id)}" data-protected="${u.protected ? '1' : '0'}" ${String(u.id) === String(currentLib.plex_home_user_id || '') ? 'selected' : ''}>${escapeHtml(u.title)}${u.protected ? ' (PIN)' : ''}</option>`
+        ).join('');
+
         section.innerHTML = `
+            <div class="ps-section">
+                <div class="ps-section-header">
+                    <h4 class="ps-section-title">Plex User</h4>
+                    <span class="ps-connection-badge ${linkedUser ? 'connected' : 'disconnected'}">
+                        <span class="ps-connection-dot"></span>
+                        ${linkedUser ? escapeHtml(linkedUser) : 'App account'}
+                    </span>
+                </div>
+                <div class="ps-help-text" style="margin-bottom:12px;">Pick who you are on Plex and the playlists you sync will belong to you there. Without a pick they belong to the app's account.</div>
+                ${homeUsers.length ? `
+                <div class="ps-form-group">
+                    <label>Plex Home user</label>
+                    <select id="ps-plex-home-user-select" onchange="onPersonalPlexHomeUserChange()">
+                        <option value="">Use app account</option>
+                        ${homeUserOpts}
+                    </select>
+                </div>
+                <div class="ps-form-group" id="ps-plex-home-pin-group" style="display:none;">
+                    <label>Plex profile PIN</label>
+                    <input type="password" id="ps-plex-home-pin" inputmode="numeric" autocomplete="off" placeholder="Used once to link, not saved">
+                </div>
+                <div class="ps-actions">
+                    <button class="ps-btn ps-btn-primary" onclick="linkPersonalPlexHomeUser()">Link</button>
+                    ${linkedUser ? '<button class="ps-btn" onclick="unlinkPersonalPlexHomeUser()">Use app account</button>' : ''}
+                </div>` : '<div class="ps-help-text">No Plex Home users found on this server.</div>'}
+            </div>
             <div class="ps-section">
                 <div class="ps-section-header">
                     <h4 class="ps-section-title">Plex Library</h4>
@@ -1721,6 +1814,7 @@ async function renderPersonalSettingsServerLibrary(container, profileData) {
                 </div>
             </div>
         `;
+        setTimeout(onPersonalPlexHomeUserChange, 0);
     } else if (serverType === 'jellyfin') {
         const selectedUser = currentLib.jellyfin_user_id || '';
         const selectedLib = currentLib.jellyfin_library_id || '';
@@ -1793,6 +1887,89 @@ async function savePersonalServerLibrary() {
         showToast('Server library settings saved', 'success');
     } catch (e) {
         showToast('Error saving settings', 'error');
+    }
+}
+
+function onPersonalPlexHomeUserChange() {
+    const select = document.getElementById('ps-plex-home-user-select');
+    const pinGroup = document.getElementById('ps-plex-home-pin-group');
+    if (!select || !pinGroup) return;
+    const opt = select.options[select.selectedIndex];
+    pinGroup.style.display = opt && opt.dataset.protected === '1' ? '' : 'none';
+}
+
+async function linkPersonalPlexHomeUser() {
+    const select = document.getElementById('ps-plex-home-user-select');
+    const userId = select ? select.value : '';
+    const pin = document.getElementById('ps-plex-home-pin')?.value || '';
+    if (!userId) {
+        showToast('Pick your Plex user first', 'error');
+        return;
+    }
+    try {
+        const res = await fetch('/api/profiles/me/plex-home-user', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, pin })
+        });
+        const data = await res.json();
+        if (!data.success) {
+            showToast(data.error || 'Could not link that Plex user', 'error');
+            return;
+        }
+        showToast(`Playlists you sync will belong to ${data.title} on Plex`, 'success');
+        openPersonalSettings(); // Reload
+    } catch (e) {
+        showToast('Error linking Plex user', 'error');
+    }
+}
+
+async function unlinkPersonalPlexHomeUser() {
+    try {
+        const res = await fetch('/api/profiles/me/plex-home-user', { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast('Plex user unlinked — using the app account', 'info');
+            openPersonalSettings(); // Reload
+        }
+    } catch (e) {
+        showToast('Error unlinking Plex user', 'error');
+    }
+}
+
+async function savePersonalNavidromeLogin() {
+    const username = (document.getElementById('ps-navidrome-username')?.value || '').trim();
+    const password = document.getElementById('ps-navidrome-password')?.value || '';
+    if (!username || !password) {
+        showToast('Enter your Navidrome username and password', 'error');
+        return;
+    }
+    try {
+        const res = await fetch('/api/profiles/me/navidrome-login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!data.success) {
+            showToast(data.error || 'Navidrome refused the login', 'error');
+            return;
+        }
+        showToast(`Playlists you sync will belong to ${username} in Navidrome`, 'success');
+        openPersonalSettings(); // Reload
+    } catch (e) {
+        showToast('Error saving Navidrome login', 'error');
+    }
+}
+
+async function clearPersonalNavidromeLogin() {
+    try {
+        const res = await fetch('/api/profiles/me/navidrome-login', { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast('Navidrome login removed — using the app account', 'info');
+            openPersonalSettings(); // Reload
+        }
+    } catch (e) {
+        showToast('Error removing Navidrome login', 'error');
     }
 }
 
@@ -2001,6 +2178,8 @@ const PROFILE_PAGE_LABELS = {
     tools: 'Tools',
     hydrabase: 'Hydrabase',
     issues: 'Issues',
+    podcasts: 'Podcasts',
+    audiobooks: 'Audiobooks',
     help: 'Help & Docs',
     settings: 'Settings',
     'artist-detail': 'Artist Detail',
@@ -2323,6 +2502,10 @@ async function loadProfileManageList() {
         editBtn.dataset.allowedPages = p.allowed_pages ? JSON.stringify(p.allowed_pages) : '';
         editBtn.dataset.canDownload = p.can_download !== false ? '1' : '0';
         editBtn.dataset.isAdmin = p.is_admin ? '1' : '0';
+        editBtn.dataset.librarySupported = data.own_library_supported === false ? '0' : '1';
+        editBtn.dataset.libraryMode = p.library_mode || 'shared';
+        editBtn.dataset.libraryRoot = p.library_root || '';
+        editBtn.dataset.libraryHint = (data.own_library_root_hint || '').replace('<name>', (p.name || 'profile').toLowerCase().replace(/[^a-z0-9]+/g, '-'));
         editBtn.title = 'Edit profile';
         editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
         actions.appendChild(editBtn);
@@ -2361,7 +2544,11 @@ async function loadProfileManageList() {
                 home_page: btn.dataset.homePage || '',
                 allowed_pages: btn.dataset.allowedPages ? JSON.parse(btn.dataset.allowedPages) : null,
                 can_download: btn.dataset.canDownload !== '0',
-                is_admin: btn.dataset.isAdmin === '1'
+                is_admin: btn.dataset.isAdmin === '1',
+                library_supported: btn.dataset.librarySupported !== '0',
+                library_mode: btn.dataset.libraryMode || 'shared',
+                library_root: btn.dataset.libraryRoot || '',
+                library_hint: btn.dataset.libraryHint || ''
             });
         };
     });
@@ -2558,6 +2745,8 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
     // Admin-only settings: side access, allowed pages & can_download
     let pageCheckboxes = [];
     let canDlCheckbox = null;
+    let ownLibCheckbox = null;
+    let ownLibRootInput = null;
     let selectedSides = null;
     if (isAdmin && !isEditingAdmin) {
         // Side access — music | video | both, never nothing.
@@ -2616,8 +2805,52 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
         canDlCheckbox.type = 'checkbox';
         canDlCheckbox.checked = profileSettings.can_download !== false;
         dlLabel.appendChild(canDlCheckbox);
-        dlLabel.appendChild(document.createTextNode(' Can download music'));
+        dlLabel.appendChild(document.createTextNode(' Can download (music, podcasts, audiobooks & video)'));
         form.appendChild(dlLabel);
+
+        // own library (#1199): this profile's downloads go to its own folder
+        // and the library it picked on the server, not the shared one
+        const olLabel = document.createElement('label');
+        olLabel.className = 'profile-checkbox-label';
+        ownLibCheckbox = document.createElement('input');
+        ownLibCheckbox.type = 'checkbox';
+        ownLibCheckbox.checked = profileSettings.library_mode === 'own';
+        ownLibCheckbox.disabled = profileSettings.library_supported === false && !ownLibCheckbox.checked;
+        olLabel.appendChild(ownLibCheckbox);
+        olLabel.appendChild(document.createTextNode(profileSettings.library_supported === false
+            ? ' Own library (requires Plex or Jellyfin)'
+            : ' Own library (separate output folder + their own server library)'));
+        form.appendChild(olLabel);
+
+        // the folder: prefilled with the install's expected path (a mount
+        // under /app/libraries/<name>, see docker-compose.yml); outside docker
+        // the admin corrects it, and a folder that is not there is refused on save
+        const olField = document.createElement('div');
+        olField.className = 'profile-folder-field';
+        olField.style.display = ownLibCheckbox.checked ? '' : 'none';
+        const olFieldLabel = document.createElement('label');
+        olFieldLabel.className = 'profile-settings-label';
+        olFieldLabel.textContent = 'Output folder';
+        olField.appendChild(olFieldLabel);
+        const olWrap = document.createElement('div');
+        olWrap.className = 'profile-folder-input';
+        olWrap.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+        ownLibRootInput = document.createElement('input');
+        ownLibRootInput.type = 'text';
+        ownLibRootInput.spellcheck = false;
+        ownLibRootInput.autocomplete = 'off';
+        ownLibRootInput.placeholder = profileSettings.library_hint || '/app/libraries/name';
+        ownLibRootInput.value = profileSettings.library_root || profileSettings.library_hint || '';
+        olWrap.appendChild(ownLibRootInput);
+        olField.appendChild(olWrap);
+        const olHelp = document.createElement('div');
+        olHelp.className = 'profile-settings-help';
+        olHelp.textContent = 'Docker: mount this folder in docker-compose.yml (see the Per-profile libraries example). Not Docker: change it to a real folder. Then point a second music library on your Plex or Jellyfin server at it and have the profile pick that library under My Settings.';
+        olField.appendChild(olHelp);
+        form.appendChild(olField);
+        ownLibCheckbox.addEventListener('change', () => {
+            olField.style.display = ownLibCheckbox.checked ? '' : 'none';
+        });
     }
 
     const btnRow = document.createElement('div');
@@ -2642,6 +2875,11 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
             payload.allowed_pages = allChecked ? null : editablePageCheckboxes.filter(cb => cb.checked).map(cb => cb.value);
             payload.can_download = canDlCheckbox ? canDlCheckbox.checked : true;
             if (selectedSides) payload.allowed_sides = selectedSides;
+            if (ownLibCheckbox) {
+                payload.library_mode = ownLibCheckbox.checked ? 'own' : 'shared';
+                payload.library_root = ownLibCheckbox.checked ? (ownLibRootInput.value || '').trim() : '';
+                if (ownLibCheckbox.checked && !payload.library_root) { alert('An own library needs an output folder'); return; }
+            }
         }
 
         try {
@@ -2704,7 +2942,7 @@ function showSelfEditForm() {
     const pageLabels = {
         dashboard: 'Dashboard', sync: 'Sync', search: 'Search', discover: 'Discover',
         automations: 'Automations', library: 'Library', stats: 'Listening Stats',
-        'playlist-explorer': 'Playlist Explorer', import: 'Import', help: 'Help & Docs'
+        'playlist-explorer': 'Playlist Explorer', import: 'Import', podcasts: 'Podcasts', help: 'Help & Docs'
     };
 
     const form = document.createElement('div');
@@ -2725,6 +2963,33 @@ function showSelfEditForm() {
     nameInput.maxLength = 20;
     nameInput.placeholder = 'Profile name';
     form.appendChild(nameInput);
+
+    // PIN
+    const pinLabel = document.createElement('label');
+    pinLabel.className = 'profile-settings-label';
+    pinLabel.textContent = currentProfile.has_pin ? 'Change PIN' : 'Add PIN';
+    form.appendChild(pinLabel);
+
+    const pinInput = document.createElement('input');
+    pinInput.type = 'password';
+    pinInput.className = 'profile-input';
+    pinInput.maxLength = 6;
+    pinInput.placeholder = currentProfile.has_pin ? 'New PIN (leave blank to keep)' : 'New PIN (optional)';
+    form.appendChild(pinInput);
+
+    // Login password
+    const passwordLabel = document.createElement('label');
+    passwordLabel.className = 'profile-settings-label';
+    passwordLabel.textContent = currentProfile.has_password ? 'Change Login Password' : 'Add Login Password';
+    form.appendChild(passwordLabel);
+
+    const passwordInput = document.createElement('input');
+    passwordInput.type = 'password';
+    passwordInput.className = 'profile-input';
+    passwordInput.maxLength = 200;
+    passwordInput.autocomplete = 'new-password';
+    passwordInput.placeholder = currentProfile.has_password ? 'New password (leave blank to keep)' : 'New password (optional)';
+    form.appendChild(passwordInput);
 
     // Home page
     const homeLabel = document.createElement('label');
@@ -2767,6 +3032,30 @@ function showSelfEditForm() {
             });
             const data = await res.json();
             if (data.success) {
+                const pin = pinInput.value.trim();
+                if (pin) {
+                    const pinRes = await fetch(`/api/profiles/${currentProfile.id}/set-pin`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ pin })
+                    });
+                    const pinData = await pinRes.json();
+                    if (!pinData.success) { alert(pinData.error || 'Failed to update PIN'); return; }
+                    currentProfile.has_pin = true;
+                }
+
+                const password = passwordInput.value;
+                if (password) {
+                    const passwordRes = await fetch(`/api/profiles/${currentProfile.id}/set-password`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password })
+                    });
+                    const passwordData = await passwordRes.json();
+                    if (!passwordData.success) { alert(passwordData.error || 'Failed to update password'); return; }
+                    currentProfile.has_password = !!passwordData.has_password;
+                }
+
                 currentProfile.name = newName;
                 currentProfile.home_page = homeSelect.value || null;
                 updateProfileIndicator();
@@ -2819,7 +3108,7 @@ async function checkAdminPinRequired() {
 // localhost).
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        navigator.serviceWorker.register(window.SoulSyncURL?.resolve('/sw.js') || '/sw.js', { scope: window.SoulSyncURL?.resolve('/') || '/' })
             .catch((err) => console.warn('[SW] registration failed:', err));
     });
 }
@@ -2956,15 +3245,15 @@ const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
     'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
-    'hydrabase', 'tools', 'chat'
+    'hydrabase', 'tools', 'chat', 'podcasts', 'audiobooks'
 ]);
 
 function _getPageFromPath() {
     const router = getWebRouter();
-    const resolved = router?.resolvePageId?.(window.location.pathname);
+    const resolved = router?.resolvePageId?.((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname));
     if (resolved) return resolved;
 
-    const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname).replace(/^\/+|\/+$/g, '');
     if (!path) return 'dashboard';
     const segs = path.split('/');
     const basePage = segs[0];
@@ -2994,7 +3283,7 @@ function buildArtistDetailPath(artistId, source = null, name = null) {
     return path;
 }
 
-function parseArtistDetailPath(pathname = window.location.pathname) {
+function parseArtistDetailPath(pathname = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) {
     const segs = String(pathname || '').split('/').filter(Boolean);
     if (segs[0] !== 'artist-detail' || segs.length < 3) return null;
 
@@ -3059,18 +3348,31 @@ function initializeMobileNavigation() {
 
     if (!hamburgerBtn || !sidebar || !overlay) return;
 
+    // One explicit state: the drawer is open only because someone opened it at
+    // a mobile width. It is not a width, and it is not carried over from the
+    // desktop layout.
     function openMobileNav() {
         sidebar.classList.add('mobile-open');
         hamburgerBtn.classList.add('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'true');
+        hamburgerBtn.setAttribute('aria-label', 'Close navigation');
         overlay.classList.add('active');
         document.body.classList.add('mobile-nav-open');
+        // Focus moves into the drawer so a keyboard isn't left behind the
+        // backdrop, and Escape below puts it back on the opener.
+        const first = sidebar.querySelector('.nav-button, a[href], button:not([disabled])');
+        if (first) first.focus();
     }
 
-    function closeMobileNav() {
+    function closeMobileNav(restoreFocus) {
+        const wasOpen = sidebar.classList.contains('mobile-open');
         sidebar.classList.remove('mobile-open');
         hamburgerBtn.classList.remove('active');
+        hamburgerBtn.setAttribute('aria-expanded', 'false');
+        hamburgerBtn.setAttribute('aria-label', 'Open navigation');
         overlay.classList.remove('active');
         document.body.classList.remove('mobile-nav-open');
+        if (wasOpen && restoreFocus === true) hamburgerBtn.focus();
     }
 
     hamburgerBtn.addEventListener('click', () => {
@@ -3081,7 +3383,33 @@ function initializeMobileNavigation() {
         }
     });
 
-    overlay.addEventListener('click', closeMobileNav);
+    overlay.addEventListener('click', () => closeMobileNav());
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!sidebar.classList.contains('mobile-open')) return;
+        closeMobileNav(true);
+    });
+
+    // Crossing the breakpoint. Going desktop -> mobile the drawer defaults
+    // CLOSED: nobody asked for it, and the drawer's slide transition made the
+    // flip paint a half-open panel over the page. Going mobile -> desktop we
+    // just drop the mobile-only classes; the collapse preference lives in
+    // html[data-sidebar] and is untouched by any of this.
+    const mobileQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+    if (mobileQuery) {
+        const onBreakpoint = () => {
+            // Kill the slide for one frame, so the layout change itself never
+            // animates across the viewport.
+            sidebar.classList.add('sidebar-no-transition');
+            closeMobileNav();
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => sidebar.classList.remove('sidebar-no-transition'));
+            });
+        };
+        if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', onBreakpoint);
+        else if (mobileQuery.addListener) mobileQuery.addListener(onBreakpoint);
+    }
 
     // Backstop for the overlay click above: the overlay is one element at a
     // fixed z-index, so anything that paints over it swallows the tap and the
@@ -3176,7 +3504,7 @@ function toggleNavSection(label) {
 function restoreNavSections() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem('navSections') || '{}'); } catch (e) { saved = {}; }
-    const path = window.location.pathname;
+    const path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
     document.querySelectorAll('.nav-section-label').forEach(label => {
         // Expanded by default; collapsed only when the user explicitly collapsed it.
         let collapsed = saved[label.dataset.section] === true;
@@ -3415,7 +3743,7 @@ function navigateToPage(pageId, options = {}) {
             : (pageId === 'artist-detail' && options.artistId) ? buildArtistDetailPath(options.artistId, options.artistSource, options.artistName)
             : (pageId === 'label-detail' && options.labelId) ? buildLabelDetailPath(options.labelId, options.labelName)
             : '/' + pageId;
-        if (window.location.pathname !== urlPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== urlPath) {
             if (options.replace === true) {
                 history.replaceState({ page: pageId }, '', urlPath);
             } else {
@@ -3713,7 +4041,7 @@ async function loadPageData(pageId) {
  */
 async function loadInitialData() {
     try {
-        const initialPath = window.location.pathname;
+        const initialPath = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
         const initialNavigationEpoch = navigationEpoch;
 
         // Snapshot hydration is best-effort chrome — bubbles and the discover
@@ -3761,7 +4089,7 @@ async function loadInitialData() {
         // was blank until you navigated by hand. Desktop wins that race and
         // never sees it; a phone is slow enough to lose it. A redirect only
         // answers the question startup was already asking, so adopt it.
-        if (window.location.pathname !== initialPath) {
+        if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== initialPath) {
             const redirectedPage = _getPageFromPath();
             if (redirectedPage && isPageAllowed(redirectedPage)) {
                 targetPage = redirectedPage;

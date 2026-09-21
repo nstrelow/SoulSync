@@ -34,14 +34,14 @@ afterEach(() => {
 describe('the header (2229-2243)', () => {
   it('renders the title, icon and subtitle', () => {
     const { container } = renderShell();
-    expect(container.querySelector('.sync-title span')?.textContent).toBe('Playlist Sync');
+    expect(container.querySelector('.sync-title span')?.textContent).toBe('Playlists');
     expect(container.querySelector('.page-header-icon')?.getAttribute('src')).toBe(
       '/static/sync.png',
     );
     // Decorative — the text beside it carries the meaning.
     expect(container.querySelector('.page-header-icon')?.getAttribute('alt')).toBe('');
     expect(container.querySelector('.sync-subtitle')?.textContent).toBe(
-      'Synchronize your Spotify, Tidal, and YouTube playlists with your media server',
+      'Manage, mirror, and synchronize your playlists with your media server',
     );
   });
 
@@ -134,6 +134,26 @@ describe('the tab strip', () => {
     const { container } = renderShell();
     const btns = Array.from(container.querySelectorAll('.sync-tab-button'));
     expect(btns.map((b) => b.getAttribute('data-tab'))).toEqual(['mirrored', 'server', 'beatport']);
+  });
+
+  it('opens YouTube Music as a routed tab, same as the other sources', () => {
+    // ytmusic has no permanent chip (like spotify-public, tidal, etc.) — it
+    // is reached through Add playlist / the account-listing flow, which
+    // opens it by id exactly like the other routed sources.
+    let open!: (tab: string) => void;
+    const { container } = renderShell({
+      registerOpenTab: (fn) => {
+        open = fn as (tab: string) => void;
+      },
+    });
+    act(() => {
+      open('ytmusic');
+    });
+    const withRouted = Array.from(container.querySelectorAll('.sync-tab-button')).map((b) =>
+      b.getAttribute('data-tab'),
+    );
+    expect(withRouted).toEqual(['mirrored', 'server', 'beatport', 'ytmusic']);
+    expect(container.querySelector('[data-tab="ytmusic"]')?.className).toContain('active');
   });
 
   it('opens on Mirrored — the library, not a source directory', () => {

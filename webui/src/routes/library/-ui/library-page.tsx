@@ -6,9 +6,14 @@ import { useProfile, useReactPageShell } from '@/platform/shell/route-controller
 
 import type { LibraryArtist, LibraryArtistsResponse } from '../-library.types';
 
-import { libraryArtistsQueryOptions, setArtistWatchlisted } from '../-library.api';
+import {
+  libraryArtistsQueryOptions,
+  libraryUnmatchedQueryOptions,
+  setArtistWatchlisted,
+} from '../-library.api';
 import { readArtistsResponse, watchlistArtistId } from '../-library.helpers';
 import { useLibraryChanged } from '../-library.live';
+import { loadTopTracks, trackArtistLabel } from '../../artist-detail/-artist-detail.top-tracks';
 import { Route } from '../route';
 import { ExportArtistsModal } from './export-modal';
 import { LibraryArtistCard } from './library-artist-card';
@@ -44,6 +49,44 @@ const SOURCE_LABELS: Record<string, string> = {
 
 const SEARCH_DEBOUNCE_MS = 300;
 
+/**
+ * The "you have tracks nobody could identify" strip (#1202).
+ *
+ * A file that imports with unreadable tags gets parked under a made-up
+ * "Unknown Artist" as its own one-track album. Re-identify could always re-file
+ * it, but it lives on an artist page, which is the last place you would look
+ * for a track whose missing field IS the artist. So the library says so out
+ * loud and links straight there.
+ *
+ * Renders nothing at all when the count is 0 or the query failed. A banner that
+ * says "0 tracks" or "could not load" is worse than no banner.
+ */
+function UnmatchedImportsBanner() {
+  const { data } = useQuery({ ...libraryUnmatchedQueryOptions(), retry: false });
+  const count = data?.count ?? 0;
+  if (count <= 0 || !data?.artist_id) return null;
+
+  return (
+    <div className="library-unmatched-banner" role="status">
+      <span className="library-unmatched-icon" aria-hidden="true">
+        ?
+      </span>
+      <div className="library-unmatched-text">
+        <strong>
+          {count} {count === 1 ? 'track' : 'tracks'} imported without a match
+        </strong>
+        <span>
+          Their tags could not be read, so they are filed under Unknown Artist instead of the album
+          they belong to. Open the artist and use Re-identify on a track to put it back.
+        </span>
+      </div>
+      <a className="library-unmatched-btn" href={`/artist-detail/library/${data.artist_id}`}>
+        Show them
+      </a>
+    </div>
+  );
+}
+
 export function LibraryPage() {
   useReactPageShell('library');
 
@@ -54,6 +97,7 @@ export function LibraryPage() {
 
   const [exporting, setExporting] = useState(false);
   const [watchingAll, setWatchingAll] = useState(false);
+  const [playing, setPlaying] = useState<ReadonlySet<string>>(new Set());
 
   // The input is local so typing stays responsive; the URL only catches up
   // after the debounce, exactly as the vanilla 300ms timer did.
@@ -154,6 +198,44 @@ export function LibraryPage() {
   const setSearch = (patch: Partial<typeof search>) =>
     void navigate({ search: (prev) => ({ ...prev, ...patch, page: patch.page ?? 1 }) });
 
+  /**
+   * Load the same popularity-ranked list as the artist hero and hand the whole
+   * context to the acquisition-aware player. Its queue preflight resolves
+   * owned files first, so a provider/Last.fm row cannot duplicate a track that
+   * is already in the library; genuine misses enter the normal download flow.
+   */
+  const playArtistTopTracks = async (artist: LibraryArtist) => {
+    const key = String(artist.id);
+    if (playing.has(key)) return;
+    setPlaying((current) => new Set(current).add(key));
+    try {
+      const state = await loadTopTracks(artist.id, artist.name);
+      if (!state.tracks.length) {
+        window.showToast?.(`No top tracks found for ${artist.name}`, 'info');
+        return;
+      }
+      const tracks = state.tracks.map((track) => {
+        const artistName = trackArtistLabel(track, artist.name);
+        return {
+          ...track,
+          title: track.title || track.name || 'Unknown Track',
+          name: track.name || track.title || 'Unknown Track',
+          artist: artistName,
+          artists: track.artists?.length ? track.artists : [{ name: artistName }],
+        };
+      });
+      await window.playTrackList?.(tracks, `${artist.name} — Top Tracks`);
+    } catch {
+      window.showToast?.(`Could not play ${artist.name}'s top tracks`, 'error');
+    } finally {
+      setPlaying((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
   // TRAP 0 — showLibraryDownloadsSection (shared-helpers.js) inserts a
   // #library-downloads-section node as a SIBLING before #library-artists-grid,
   // and fires on download events, not just page load. It is bound to
@@ -165,6 +247,12 @@ export function LibraryPage() {
   useEffect(() => {
     window.showLibraryDownloadsSection?.();
   }, []);
+
+  const clearSearch = () => {
+    setDraft('');
+    committed.current = '';
+    void navigate({ search: (prev) => ({ ...prev, q: '', page: 1 }), replace: true });
+  };
 
   return (
     // The ids below are the guided tour's anchors (helper.js HELP_CONTENT).
@@ -210,39 +298,64 @@ export function LibraryPage() {
         {watchingAll ? <WatchAllModal onClose={() => setWatchingAll(false)} /> : null}
       </div>
 
-      <div className="library-controls">
-        <div className="library-search-container">
-          <input
-            type="text"
-            className="library-search-input"
-            id="library-search-input"
-            placeholder="Filter your library…"
-            aria-label="Filter your library"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              // Escape clears the box AND reloads, as the vanilla handler did.
-              if (e.key !== 'Escape') return;
-              setDraft('');
-              committed.current = '';
-              void navigate({ search: (prev) => ({ ...prev, q: '', page: 1 }), replace: true });
-            }}
-          />
-          <div className="library-search-icon">🔍</div>
-        </div>
+      <UnmatchedImportsBanner />
 
-        <div className="watchlist-filter" id="watchlist-filter">
-          {(['all', 'watched', 'unwatched'] as const).map((f) => (
-            <button
-              key={f}
-              type="button"
-              className={`watchlist-filter-btn${search.watchlist === f ? ' active' : ''}`}
-              data-filter={f}
-              onClick={() => setSearch({ watchlist: f })}
-            >
-              {f === 'all' ? 'All' : f === 'watched' ? 'Watched' : 'Unwatched'}
-            </button>
-          ))}
+      <div className="library-controls">
+        {/* One row for the three filters. They used to stack, and with the
+            header and the alphabet strip the cards started 435px down. */}
+        <div className="library-toolbar">
+          <div className="library-search-container">
+            <div className="library-search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <circle cx="11" cy="11" r="7" />
+                <path d="M20 20l-3.5-3.5" strokeLinecap="round" />
+              </svg>
+            </div>
+            <input
+              type="text"
+              className="library-search-input"
+              id="library-search-input"
+              placeholder="Filter your library…"
+              aria-label="Filter your library"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                // Escape clears the box AND reloads, as the vanilla handler did.
+                if (e.key !== 'Escape') return;
+                clearSearch();
+              }}
+            />
+            {draft ? (
+              <button
+                type="button"
+                className="library-search-clear-btn"
+                aria-label="Clear search"
+                title="Clear"
+                onClick={clearSearch}
+              >
+                ×
+              </button>
+            ) : null}
+          </div>
+
+          <div
+            className="watchlist-filter"
+            id="watchlist-filter"
+            role="group"
+            aria-label="Watchlist"
+          >
+            {(['all', 'watched', 'unwatched'] as const).map((f) => (
+              <button
+                key={f}
+                type="button"
+                className={`watchlist-filter-btn${search.watchlist === f ? ' active' : ''}`}
+                data-filter={f}
+                onClick={() => setSearch({ watchlist: f })}
+              >
+                {f === 'all' ? 'All' : f === 'watched' ? 'Watched' : 'Unwatched'}
+              </button>
+            ))}
+          </div>
           {/* Only offered while filtered to unwatched — it acts on that set. */}
           <button
             type="button"
@@ -252,32 +365,32 @@ export function LibraryPage() {
             <span className="watchlist-all-icon">👁️</span>
             <span className="watchlist-all-text">Watch All Unwatched</span>
           </button>
-        </div>
 
-        <div className="library-source-filter">
-          <select
-            className="library-source-filter-select"
-            aria-label="Filter by metadata source"
-            value={search.source}
-            onChange={(e) => setSearch({ source: e.target.value })}
-          >
-            <option value="">All Sources</option>
-            {/* The `!` prefix means "unmatched to", and the backend parses it. */}
-            <optgroup label="Unmatched to">
-              {SOURCES.map((s) => (
-                <option key={`!${s}`} value={`!${s}`}>
-                  No {SOURCE_LABELS[s]}
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="Matched to">
-              {SOURCES.map((s) => (
-                <option key={s} value={s}>
-                  Has {SOURCE_LABELS[s]}
-                </option>
-              ))}
-            </optgroup>
-          </select>
+          <div className="library-source-filter">
+            <select
+              className="library-source-filter-select"
+              aria-label="Filter by metadata source"
+              value={search.source}
+              onChange={(e) => setSearch({ source: e.target.value })}
+            >
+              <option value="">All Sources</option>
+              {/* The `!` prefix means "unmatched to", and the backend parses it. */}
+              <optgroup label="Unmatched to">
+                {SOURCES.map((s) => (
+                  <option key={`!${s}`} value={`!${s}`}>
+                    No {SOURCE_LABELS[s]}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Matched to">
+                {SOURCES.map((s) => (
+                  <option key={s} value={s}>
+                    Has {SOURCE_LABELS[s]}
+                  </option>
+                ))}
+              </optgroup>
+            </select>
+          </div>
         </div>
 
         <div className="alphabet-selector" id="alphabet-selector">
@@ -320,6 +433,8 @@ export function LibraryPage() {
               href={`/artist-detail/library/${artist.id}`}
               onToggleWatch={() => watchArtist.mutate(artist)}
               watchPending={watching.has(String(artist.id))}
+              onPlay={() => void playArtistTopTracks(artist)}
+              playPending={playing.has(String(artist.id))}
             />
           ))}
         </div>

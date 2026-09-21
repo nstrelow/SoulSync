@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+from utils.logging_config import get_logger
 
 # Album grouping lives in core.imports.album_naming; this module keeps the
 # imported helper because the path builder still needs it.
@@ -23,7 +24,7 @@ from core.imports.context import (
     normalize_import_context,
 )
 
-logger = logging.getLogger("imports.paths")
+logger = get_logger("imports.paths")
 
 
 def artist_letter(artist, symbol_fallback=None):
@@ -159,6 +160,65 @@ def config_root_path(path_str: Any, default: str = "") -> str:
     return docker_resolve_path(raw)
 
 
+# ── the library root a download lands in (#1199) ─────────────────────────────
+#
+# a profile with a library of its own has its own output folder. a download
+# knows its profile through the batch that made it (every batch carries
+# profile_id) or an explicit stamp on its context (imports from the page);
+# everything else, and every profile on the shared library, lands in the
+# configured transfer folder exactly as before.
+
+def import_profile_id(context) -> Optional[int]:
+    """the profile a download/import is for, or None when it has none."""
+    if not isinstance(context, dict):
+        return None
+    pid = context.get("profile_id")
+    if pid:
+        try:
+            return int(pid)
+        except (TypeError, ValueError):
+            pass
+    batch_id = context.get("batch_id")
+    if batch_id:
+        try:
+            from core.runtime_state import download_batches
+            batch = download_batches.get(batch_id) or {}
+            pid = batch.get("profile_id")
+            return int(pid) if pid else None
+        except Exception:  # noqa: BLE001 - runtime state not importable in a bare tool
+            return None
+    return None
+
+
+def library_root_for_profile(profile_id) -> Optional[str]:
+    """the own-library output folder of a profile (docker-resolved), or None
+    when the profile is on the shared library."""
+    if not profile_id:
+        return None
+    from core.library_scope import own_library_supported
+    if not own_library_supported():
+        return None
+    try:
+        from database.music_database import get_database
+        lib = get_database().get_profile_library(int(profile_id))
+    except Exception as exc:  # noqa: BLE001 - no db, no own library
+        logger.debug("own library lookup failed for profile %s: %s", profile_id, exc)
+        return None
+    if lib.get("mode") != "own" or not lib.get("root"):
+        return None
+    return config_root_path(lib["root"])
+
+
+def shared_transfer_root() -> str:
+    return config_root_path(_get_config_manager().get("soulseek.transfer_path", "./Transfer"), "./Transfer")
+
+
+def transfer_root_for_context(context) -> str:
+    """where this download/import's files go: the profile's own folder when
+    it has one, the configured transfer folder otherwise."""
+    return library_root_for_profile(import_profile_id(context)) or shared_transfer_root()
+
+
 def build_simple_download_destination(context, file_path: str):
     """Build the destination path for a simple download into Transfer."""
     context = normalize_import_context(context)
@@ -166,8 +226,7 @@ def build_simple_download_destination(context, file_path: str):
     if not isinstance(search_result, dict):
         search_result = {}
 
-    transfer_dir = Path(config_root_path(
-        _get_config_manager().get("soulseek.transfer_path", "./Transfer"), "./Transfer"))
+    transfer_dir = Path(transfer_root_for_context(context))
     album_name = None
     original_filename = search_result.get("filename", "")
     if "/" in original_filename or "\\" in original_filename:
@@ -590,15 +649,25 @@ def _coerce_int(value: Any, default: int = 1) -> int:
     return coerced if coerced > 0 else default
 
 
-def _reachable_original_dir(original_path: Any) -> str | None:
-    """Directory of an enhance/upgrade's existing library file, or ``None``.
+def _reachable_original_file(original_path: Any) -> str | None:
+    """An enhance/upgrade's existing library file AS THIS PROCESS SEES IT, or ``None``.
 
     ``None`` means "do not replace in place": either the recorded path can't be
     mapped onto anything this process can see, or its folder no longer exists.
     The caller then builds the normal template destination (#1109) instead of
     trying to ``makedirs`` a media-server-only root such as ``/music``.
 
-    Note this only ever RETURNS an existing directory — it never creates one.
+    Returns the resolved FILE, not just its folder, because the caller needs
+    both halves of the destination to come from the SAME candidate. It used to
+    return only the parent, leaving the caller to rebuild the filename from the
+    RECORDED path with ``os.path.basename`` — which does not split backslashes
+    on posix. A library scanned on Windows (``\\\\server\\share\\...``) while
+    SoulSync runs in Linux therefore produced a destination whose "filename"
+    was the entire recorded path, and every upgrade died on the move (#1215).
+    The resolver already normalizes separators; keeping its answer whole is the
+    fix.
+
+    Note this only ever RETURNS an existing file — it never creates anything.
     That is the whole point: the old behaviour created the media server's path
     inside the container.
     """
@@ -630,7 +699,7 @@ def _reachable_original_dir(original_path: Any) -> str | None:
                 "[Enhance] original sits in a library root (%s) — filing the "
                 "upgrade by template instead of replacing in place", parent)
             continue
-        return parent
+        return candidate
     return None
 
 
@@ -667,9 +736,8 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         if create_dirs:
             _real_makedirs(path, exist_ok=True)
 
-    transfer_dir = config_root_path(
-        _get_config_manager().get("soulseek.transfer_path", "./Transfer"), "./Transfer")
     context = normalize_import_context(context)
+    transfer_dir = transfer_root_for_context(context)
     track_info = get_import_track_info(context)
     original_search = get_import_original_search(context)
     album_context = get_import_context_album(context)
@@ -682,12 +750,16 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             source_info = json.loads(source_info)
         except (json.JSONDecodeError, TypeError):
             source_info = {}
-    if source_info.get("enhance") and source_info.get("original_file_path"):
-        original_dir = _reachable_original_dir(source_info["original_file_path"])
-        if original_dir:
-            original_stem = os.path.splitext(
-                os.path.basename(source_info["original_file_path"]))[0]
-            final_path = os.path.join(original_dir, original_stem + file_ext)
+    if not isinstance(source_info, dict):
+        source_info = {}
+    replace_original = source_info.get("enhance") or source_info.get("job") == "quality_upgrade"
+    if replace_original and source_info.get("original_file_path"):
+        original_file = _reachable_original_file(source_info["original_file_path"])
+        if original_file:
+            # Folder AND stem from the resolved file, swapping only the
+            # extension. Splitting the RECORDED path here is what produced a
+            # windows path as a filename (#1215).
+            final_path = os.path.splitext(original_file)[0] + file_ext
             logger.info("[Enhance] Using original file location: %s", final_path)
             return final_path, True
         # #1109: `original_file_path` is the path as RECORDED, which is usually

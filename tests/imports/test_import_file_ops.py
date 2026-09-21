@@ -116,6 +116,10 @@ def test_read_staging_file_metadata_reads_tags(monkeypatch, tmp_path):
         "album": "Album One",
         "track_number": 3,
         "disc_number": 2,
+        # off audio.info; the dummy has none, and "fake" is 4 bytes on disk
+        "duration_ms": 0,
+        "bitrate": 0,
+        "size": 4,
     }
 
 
@@ -186,6 +190,9 @@ def test_read_staging_file_metadata_uses_filename_fallbacks_when_tags_are_invali
         "album": "Album One",
         "track_number": 2,
         "disc_number": 1,
+        "duration_ms": 0,
+        "bitrate": 0,
+        "size": 4,
     }
 
 
@@ -460,6 +467,31 @@ def test_opus_quality_chip_estimates_bitrate_when_header_has_none(tmp_path, monk
     assert aq is not None
     assert aq.format == "opus"
     assert aq.bitrate == 160
+
+
+def test_probe_audio_quality_reads_explicit_alac_extension(tmp_path, monkeypatch):
+    path = tmp_path / "source.alac"
+    path.write_bytes(b"fake-alac")
+
+    class _Info:
+        codec = "alac"
+        bitrate = 4_608_000
+        sample_rate = 96_000
+        bits_per_sample = 24
+
+    class _MP4:
+        def __init__(self, _path):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.mp4.MP4", _MP4)
+
+    aq = _fo.probe_audio_quality(str(path))
+
+    assert aq is not None
+    assert aq.format == "alac"
+    assert aq.bitrate == 4608
+    assert aq.sample_rate == 96_000
+    assert aq.bit_depth == 24
 
 
 def test_opus_256_estimate_meets_opus_192_target(tmp_path, monkeypatch):

@@ -41,6 +41,19 @@ describe('LibraryArtistCard image fallback', () => {
     expect(placeholder()).not.toBeNull();
   });
 
+  it('starts at Deezer when there is no stored photo but a Deezer id (#1253)', () => {
+    // a jellyfin artist with no server art, matched by enrichment: the artist
+    // page shows deezer's photo, so the grid must too instead of a music note
+    renderCard({ id: 1, deezer_id: 27 });
+    expect(placeholder()).toBeNull();
+    expect(img()!.src).toBe('https://api.deezer.com/artist/27/image?size=big');
+
+    // and a dead deezer url still ends at the placeholder, without looping
+    fireEvent.error(img()!);
+    expect(img()).toBeNull();
+    expect(placeholder()).not.toBeNull();
+  });
+
   it('falls back through Deezer before giving up', () => {
     // The vanilla onerror hopped to Deezer's image API once; dropping that hop
     // would lose artwork for every artist whose stored url has rotted.
@@ -65,6 +78,24 @@ describe('LibraryArtistCard image fallback', () => {
   it('lazy-loads, so a 75-card page does not fetch 75 images at once', () => {
     renderCard({ id: 1, image_url: 'https://cdn/a.jpg' });
     expect(img()!.getAttribute('loading')).toBe('lazy');
+  });
+
+  it('eases in once the bytes arrive instead of popping', () => {
+    // hidden until load, then the css transition carries opacity 0 -> 1
+    renderCard({ id: 1, image_url: 'https://cdn/a.jpg' });
+    expect(img()!.className).toBe('is-loading');
+    fireEvent.load(img()!);
+    expect(img()!.className).toBe('is-loaded');
+  });
+
+  it('fades again on the deezer retry', () => {
+    renderCard({ id: 1, image_url: 'https://cdn/rotted.jpg', deezer_id: 27 });
+    fireEvent.load(img()!);
+    expect(img()!.className).toBe('is-loaded');
+    fireEvent.error(img()!);
+    expect(img()!.className).toBe('is-loading');
+    fireEvent.load(img()!);
+    expect(img()!.className).toBe('is-loaded');
   });
 });
 
@@ -218,5 +249,52 @@ describe('LibraryArtistCard link', () => {
   it('omits the stat line entirely when the artist has no tracks', () => {
     renderCard({ id: 1, track_count: 0 });
     expect(document.querySelector('.library-artist-stat')).toBeNull();
+  });
+});
+
+describe('LibraryArtistCard play action', () => {
+  it('plays top tracks without following the artist link', () => {
+    const onPlay = vi.fn();
+    render(
+      <LibraryArtistCard
+        artist={{ id: 1, name: 'Aphex Twin' }}
+        index={0}
+        href="/artist-detail/library/1"
+        onPlay={onPlay}
+      />,
+    );
+
+    const button = document.querySelector('.library-artist-play-btn') as HTMLElement;
+    expect(button.getAttribute('aria-label')).toBe('Play top tracks by Aphex Twin');
+    expect(fireEvent.click(button)).toBe(false);
+    expect(onPlay).toHaveBeenCalledTimes(1);
+  });
+
+  it('is keyboard accessible and inert while the list is loading', () => {
+    const onPlay = vi.fn();
+    const { rerender } = render(
+      <LibraryArtistCard
+        artist={{ id: 1, name: 'Aphex Twin' }}
+        index={0}
+        href="/artist-detail/library/1"
+        onPlay={onPlay}
+      />,
+    );
+    fireEvent.keyDown(document.querySelector('.library-artist-play-btn')!, { key: 'Enter' });
+    expect(onPlay).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <LibraryArtistCard
+        artist={{ id: 1, name: 'Aphex Twin' }}
+        index={0}
+        href="/artist-detail/library/1"
+        onPlay={onPlay}
+        playPending
+      />,
+    );
+    const button = document.querySelector('.library-artist-play-btn') as HTMLElement;
+    expect(button.textContent).toBe('…');
+    fireEvent.click(button);
+    expect(onPlay).toHaveBeenCalledTimes(1);
   });
 });

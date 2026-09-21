@@ -16,7 +16,7 @@ from core.imports.file_ops import (
     create_lossy_copy,
     downsample_hires_flac,
     get_audio_quality_string,
-    get_quality_tier_from_extension,
+    probe_audio_quality,
     safe_move_file,
 )
 from core.imports.context import (
@@ -71,6 +71,7 @@ from core.runtime_state import (
 from core.metadata.artwork import download_cover_art
 from core.metadata.common import wipe_source_tags
 from core.imports.tag_policy import should_wipe_tags_on_enhancement_failure
+from core.imports.quality_replace import is_profile_upgrade
 from core.metadata.enrichment import enhance_file_metadata
 from core.imports.paths import (
     build_final_path_for_track,
@@ -362,8 +363,11 @@ def _maybe_stage_album_track(context, final_path):
                     logger.info("[Atomic Publish] Batch %s: NOT flagged as an album download "
                                 "— publishing directly (atomic only applies to album batches)", batch_id)
                 else:
-                    transfer_dir = docker_resolve_path(
-                        config_manager.get('soulseek.transfer_path', './Transfer'))
+                    # an own-library profile's batch stages under its folder (#1199)
+                    from core.imports.paths import library_root_for_profile
+                    transfer_dir = (library_root_for_profile(batch.get('profile_id'))
+                                    or docker_resolve_path(
+                                        config_manager.get('soulseek.transfer_path', './Transfer')))
                     album_folder = os.path.dirname(final_path)
                     if album_folder_is_fresh(album_folder):
                         _staging_root = staging_root_for_batch(transfer_dir, batch_id)
@@ -430,6 +434,58 @@ def _persist_verification_status(context, final_path):
                 write_verification_status(str(final_path), status)
     except Exception as _vs_err:
         logger.debug(f"verification-status persist skipped: {_vs_err}")
+
+
+def _apply_profile_output_transforms(final_path: str, context: dict,
+                                     profile: dict) -> str:
+    """Apply downsample/lossy retention while preserving acquisition truth."""
+    acquired_quality = probe_audio_quality(final_path)
+    if acquired_quality is not None:
+        context['_acquired_audio_quality'] = acquired_quality.to_dict()
+
+    downsampled_path = downsample_hires_flac(
+        final_path, context, enabled=profile.get('downsample_enabled'))
+    if downsampled_path:
+        final_path = downsampled_path
+        context['_final_processed_path'] = final_path
+        retained_quality = probe_audio_quality(final_path)
+        context.setdefault('_retention_transforms', []).append({
+            'type': 'downsample_hires_flac',
+            'source_replaced': True,
+            'target_bit_depth': 16,
+            'target_sample_rate': 44100,
+            'output_quality': retained_quality.to_dict() if retained_quality else None,
+        })
+
+    _persist_verification_status(context, final_path)
+
+    lossy_path = create_lossy_copy(final_path, settings={
+        'enabled': profile.get('lossy_copy_enabled'),
+        'codec': profile.get('lossy_copy_codec'),
+        'bitrate': profile.get('lossy_copy_bitrate'),
+        'delete_original': profile.get('lossy_copy_delete_original'),
+    } if profile else None)
+    if not lossy_path:
+        return final_path
+
+    source_retained = os.path.isfile(final_path)
+    lossy_quality = probe_audio_quality(lossy_path)
+    context.setdefault('_retention_transforms', []).append({
+        'type': 'lossy_copy',
+        'source_replaced': not source_retained,
+        'codec': profile.get('lossy_copy_codec'),
+        'bitrate': profile.get('lossy_copy_bitrate'),
+        'output_quality': lossy_quality.to_dict() if lossy_quality else None,
+    })
+    if source_retained:
+        companions = context.setdefault('_companion_file_paths', [])
+        if lossy_path not in companions:
+            companions.append(lossy_path)
+        context['_final_processed_path'] = final_path
+        return final_path
+
+    context['_final_processed_path'] = lossy_path
+    return lossy_path
 
 
 def post_process_matched_download(context_key, context, file_path, runtime, metadata_runtime=None):
@@ -1070,10 +1126,27 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             logger.info(f"[FIX] Updated album_info disc_number to {_resolved_disc} for consistent metadata")
         album_info['disc_number'] = _resolved_disc
 
+        _enhance_source_info = get_import_track_info(context).get('source_info') or {}
+        if isinstance(_enhance_source_info, str):
+            try:
+                _enhance_source_info = json.loads(_enhance_source_info)
+            except (json.JSONDecodeError, TypeError):
+                _enhance_source_info = {}
+        if not isinstance(_enhance_source_info, dict):
+            _enhance_source_info = {}
+        is_enhance_download = _enhance_source_info.get('enhance', False)
+        # Finder-approved wishlist items already persist this per-track job
+        # provenance. It authorizes a measured upgrade, never a blanket force
+        # overwrite of the batch (ordinary wishlist items stay protected).
+        is_quality_upgrade = _enhance_source_info.get('job') == 'quality_upgrade'
+
         final_path, _ = build_final_path_for_track(context, artist_context, album_info, file_ext)
         # #999 atomic album publish (opt-in): redirect to a private staging mirror
         # for fresh whole-album batches; returns final_path unchanged otherwise.
-        final_path = _maybe_stage_album_track(context, final_path)
+        # Upgrades publish at the live destination before retiring an old copy;
+        # a private album staging path is not a completed replacement.
+        if not is_quality_upgrade:
+            final_path = _maybe_stage_album_track(context, final_path)
         logger.info(f"Resolved path: '{final_path}'")
         context['_final_processed_path'] = final_path
 
@@ -1104,18 +1177,43 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     "preserving the file's existing tags (not wiping): %s",
                     os.path.basename(file_path))
 
-        _enhance_source_info = context.get('track_info', {}).get('source_info') or {}
-        if isinstance(_enhance_source_info, str):
-            try:
-                _enhance_source_info = json.loads(_enhance_source_info)
-            except (json.JSONDecodeError, TypeError):
-                _enhance_source_info = {}
-        is_enhance_download = _enhance_source_info.get('enhance', False)
         # "Force download" is replace-intent: the user explicitly re-downloaded
         # something they already own, so the metadata-protection skip must not
         # discard it (#1045). Rides the same replace path as enhance — the
         # short-file replacement guard above still applies.
         force_replace = _batch_force_replace(context)
+
+        quality_profile = _resolve_context_quality_profile(context)
+        replace_lower = quality_profile.get(
+            'replace_lower_quality', config_manager.get('import.replace_lower_quality', False))
+        upgrade_original = None
+        if is_quality_upgrade and _enhance_source_info.get('original_file_path'):
+            from core.library.path_resolver import resolve_library_file_path
+            upgrade_original = resolve_library_file_path(
+                _enhance_source_info['original_file_path'], config_manager=config_manager)
+
+        # Run outside the metadata try/except: neither missing tags nor a
+        # metadata read error may turn a failed quality comparison into a
+        # permitted overwrite. Check the original too when the extension or
+        # destination changed; it must survive until the new file is published.
+        if is_quality_upgrade or (replace_lower and not is_enhance_download and not force_replace):
+            replacement_paths = {p for p in (final_path, upgrade_original) if p and os.path.isfile(p)}
+            for existing_path in replacement_paths:
+                if not is_profile_upgrade(existing_path, file_path, quality_profile):
+                    reason = 'Incoming file is not a verified improvement under the quality profile'
+                    logger.info("[Protection] %s: %s", reason, existing_path)
+                    context['_context_failure_msg'] = reason
+                    return
+            if upgrade_original and os.path.normpath(upgrade_original) != os.path.normpath(final_path):
+                if not _replacement_length_is_safe(upgrade_original, file_path):
+                    reason = 'Replacement guard: incoming file is far shorter than the library file'
+                    context['_integrity_failure_msg'] = reason
+                    try:
+                        qpath = move_to_quarantine(file_path, context, reason, automation_engine, trigger='integrity')
+                        _mark_task_quarantined(context, qpath)
+                    except Exception as exc:
+                        logger.error("Could not quarantine short upgrade (original retained): %s", exc)
+                    return
 
         logger.info(f"Moving '{os.path.basename(file_path)}' to '{final_path}'")
         if os.path.exists(final_path):
@@ -1164,29 +1262,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 existing_file = MutagenFile(final_path)
                 has_metadata = existing_file is not None and len(existing_file.tags or {}) > 2
                 if has_metadata and not is_enhance_download and not force_replace:
-                    _replace_lower = _resolve_context_quality_profile(context).get(
-                        'replace_lower_quality',
-                        config_manager.get('import.replace_lower_quality', False))
-                    if _replace_lower:
-                        _existing_tier = get_quality_tier_from_extension(final_path)
-                        _incoming_tier = get_quality_tier_from_extension(file_path)
-                        if _incoming_tier[1] < _existing_tier[1]:
-                            logger.info(f"[Quality Replace] Replacing {_existing_tier[0]} with {_incoming_tier[0]}: {os.path.basename(final_path)}")
-                        else:
-                            logger.info(
-                                f"[Protection] Existing file is same or better quality ({_existing_tier[0]} vs {_incoming_tier[0]}) - skipping: "
-                                f"{os.path.basename(final_path)}"
-                            )
-                            try:
-                                os.remove(file_path)
-                            except FileNotFoundError:
-                                pass
-                            except Exception as e:
-                                logger.error(f"[Protection] Error removing redundant file: {e}")
-                            context['_pipeline_import_succeeded'] = not os.path.exists(file_path)
-                            if not context['_pipeline_import_succeeded']:
-                                context['_context_failure_msg'] = 'could not remove redundant import source'
-                            return
+                    if replace_lower or is_quality_upgrade:
+                        logger.info("[Quality Replace] Verified profile improvement: %s", os.path.basename(final_path))
                     else:
                         logger.info(f"[Protection] Existing file already has metadata enhancement - skipping overwrite: {os.path.basename(final_path)}")
                         logger.info(f"[Protection] Removing redundant download file: {os.path.basename(file_path)}")
@@ -1250,6 +1327,19 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         move_companion_sidecars(file_path, final_path)
         cleanup_slskd_dedup_siblings(file_path)
 
+        if (is_quality_upgrade and upgrade_original
+                and os.path.normpath(upgrade_original) != os.path.normpath(final_path)
+                and os.path.isfile(upgrade_original)):
+            # Recheck before retiring a different-path original: another import
+            # may have upgraded it while this download was being published.
+            if (is_profile_upgrade(upgrade_original, final_path, quality_profile)
+                    and _replacement_length_is_safe(upgrade_original, final_path)):
+                try:
+                    os.remove(upgrade_original)
+                    logger.info("[Quality Replace] Retired superseded file: %s", upgrade_original)
+                except OSError as exc:
+                    logger.warning("[Quality Replace] New file imported but old copy could not be removed: %s", exc)
+
         if is_enhance_download and _enhance_source_info.get('original_file_path'):
             original_enhance_path = _enhance_source_info['original_file_path']
             # #1109 second half: the recorded path is the MEDIA SERVER's view of
@@ -1298,23 +1388,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 pp_logger.debug(f"ReplayGain analysis skipped: {rg_err}")
 
         _qp_post = _resolve_context_quality_profile(context)
-        downsampled_path = downsample_hires_flac(
-            final_path, context,
-            enabled=_qp_post.get('downsample_enabled'))
-        if downsampled_path:
-            final_path = downsampled_path
-            context['_final_processed_path'] = final_path
-
-        _persist_verification_status(context, final_path)
-
-        blasphemy_path = create_lossy_copy(final_path, settings={
-            'enabled': _qp_post.get('lossy_copy_enabled'),
-            'codec': _qp_post.get('lossy_copy_codec'),
-            'bitrate': _qp_post.get('lossy_copy_bitrate'),
-            'delete_original': _qp_post.get('lossy_copy_delete_original'),
-        } if _qp_post else None)
-        if blasphemy_path:
-            context['_final_processed_path'] = blasphemy_path
+        final_path = _apply_profile_output_transforms(
+            final_path, context, _qp_post)
 
         downloads_path = docker_resolve_path(config_manager.get('soulseek.download_path', './downloads'))
         cleanup_empty_directories(downloads_path, file_path)
@@ -1687,6 +1762,13 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             with tasks_lock:
                 if task_id in download_tasks:
                     _mark_task_completed(task_id, context.get('track_info'))
+                    # The playback queue polls the task status and needs the
+                    # verified library path before it can replace its original
+                    # ``missing`` row with a playable one.  The inner pipeline
+                    # cannot persist this itself because this wrapper removes
+                    # task_id/batch_id while post-processing runs.  Keep the
+                    # path on the task at the same point we mark it completed.
+                    download_tasks[task_id]['final_file_path'] = expected_final_path
                     download_tasks[task_id]['metadata_enhanced'] = True
                     if context.get('_verification_status'):
                         download_tasks[task_id]['verification_status'] = context['_verification_status']

@@ -43,6 +43,18 @@ if not _os.environ.get('SOULSYNC_TEST_DB_READY'):
     _os.environ['SOULSYNC_TEST_DB_READY'] = '1'
     _atexit.register(lambda: _shutil.rmtree(_TEST_DB_DIR, ignore_errors=True))
 
+# The image cache has the same hazard as the DBs, and it sits OUTSIDE the
+# READY block on purpose: a test file that sets DATABASE_PATH + READY itself
+# skips the block above, and it must still not touch storage/image_cache.
+# get_image_cache() resolves that dir from config (the repo), so any test
+# reaching /api/video/img or /api/image-cache/* wrote 1-byte fakes into the
+# developer's live cache — from WSL, a second sqlite writer on a WAL the
+# Windows server had open. That corrupted Boulder's index on Sept 15 2026.
+if not _os.environ.get('SOULSYNC_IMAGE_CACHE_DIR'):
+    _TEST_IMAGE_CACHE_DIR = _tempfile.mkdtemp(prefix='soulsync-test-imagecache-')
+    _os.environ['SOULSYNC_IMAGE_CACHE_DIR'] = _TEST_IMAGE_CACHE_DIR
+    _atexit.register(lambda: _shutil.rmtree(_TEST_IMAGE_CACHE_DIR, ignore_errors=True))
+
 import copy
 import os as _os
 import pytest
@@ -1345,6 +1357,16 @@ def reset_state(_inert_video_enrichment_engine, _inert_video_download_monitor):
     # every bit of it a previous test's reservation.
     from core.prowlarr_throttle import _reset_for_tests as _reset_prowlarr_throttle
     _reset_prowlarr_throttle()
+    # Video download-source cooldowns (core.automation.handlers.
+    # video_process_wishlist): two process-wide dicts keyed by (item, transport).
+    # Two client refusals put that pair on a SIX HOUR cooldown, and the test
+    # items all look alike ('A' on torrent), so one test recording refusals made
+    # every later test in the process find its candidates cooled and grab
+    # nothing. That is how eight refusal-walk tests failed together with an
+    # empty `tried` list while each passed alone. Fourth module-global of this
+    # exact shape; same treatment.
+    from core.automation.handlers.video_process_wishlist import reset_source_cooldowns
+    reset_source_cooldowns()
     # Enrichment status TTL cache (core.enrichment.api): a cached stats dict
     # must never leak into the next test's registry (same service id, new fake).
     from core.enrichment.api import _invalidate_status_cache

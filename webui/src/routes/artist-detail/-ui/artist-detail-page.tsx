@@ -36,6 +36,7 @@ import {
   releaseToAlbumData,
   stillCheckingMessage,
 } from '../-artist-detail.open-release';
+import { checkTracksBody, mergeOwnership } from '../-artist-detail.owned-tracks';
 import { scrollArtistDetailToTop } from '../-artist-detail.scroll';
 import { useCompletionStream } from '../-artist-detail.use-completion';
 import { useEnhancedData } from '../-artist-detail.use-enhanced';
@@ -44,6 +45,7 @@ import { clearVanillaArtist, syncVanillaArtist } from '../-artist-detail.vanilla
 import { ArtistDetailBackButton } from './artist-detail-back-button';
 import { ArtistHero } from './artist-hero';
 import { ArtistVideosSection } from './artist-videos-section';
+import { ConcertsSection } from './concerts-section';
 import { DiscographyFilters } from './discography-filters';
 import { DiscographySection } from './discography-section';
 import { EnhancedView } from './enhanced-view';
@@ -319,6 +321,72 @@ export function ArtistDetailPage() {
     }
   };
 
+  const playRelease = async (release: DiscographyRelease) => {
+    if (!isReleaseClickable(release)) {
+      window.showToast?.(stillCheckingMessage(release), 'info');
+      return;
+    }
+    if (!payload) return;
+
+    const image = heroImage(payload.artist ?? {}, displayed);
+    const artist = openReleaseArtist(payload, payload.artist?.id, image.primary);
+    if (!artist) {
+      window.showToast?.('Error: No artist information available', 'error');
+      return;
+    }
+
+    window.showLoadingOverlay?.('Loading album...');
+    try {
+      const album = releaseToAlbumData(release);
+      const params = new URLSearchParams(albumTracksParams(release, artist));
+      const response = await fetch(`/api/album/${album.id}/tracks?${params}`);
+      if (!response.ok) throw new Error(`Failed to load album tracks: ${response.status}`);
+
+      const data = await response.json();
+      if (!data.success || !data.tracks?.length)
+        throw new Error('No tracks found for this release');
+
+      const tracks = data.tracks.map((track: Record<string, unknown>) => ({
+        ...track,
+        title: track.title || track.name || 'Unknown Track',
+        name: track.name || track.title || 'Unknown Track',
+        artist: track.artist || track.artist_name || artist.name,
+        artists:
+          Array.isArray(track.artists) && track.artists.length
+            ? track.artists
+            : [{ name: artist.name }],
+        album: track.album || track.album_title || album.name,
+        image_url: track.image_url || album.image_url || artist.image_url,
+      }));
+      // Resolve what the library already has BEFORE handing the queue over.
+      // These rows come from the metadata endpoint and never carry a
+      // file_path, and the player reads that as "download this first" - which
+      // fails outright when auto-download is off, even for an album owned in
+      // full. A failed lookup is not fatal: play what we have and let the
+      // normal download path deal with the rest.
+      let playable = tracks;
+      try {
+        const owned = await fetch('/api/library/check-tracks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(checkTracksBody(artist.name, String(album.name || ''), tracks)),
+        });
+        if (owned.ok) {
+          const ownedData = await owned.json();
+          if (ownedData?.success) playable = mergeOwnership(tracks, ownedData.owned_tracks);
+        }
+      } catch {
+        // ignored on purpose - see above
+      }
+
+      window.hideLoadingOverlay?.();
+      await window.playTrackList?.(playable, String(album.name || 'Album'));
+    } catch (error) {
+      window.hideLoadingOverlay?.();
+      window.showToast?.(`Could not play that album: ${(error as Error).message}`, 'error');
+    }
+  };
+
   // The hero stays hidden on failure — the vanilla kept it hidden rather than
   // showing an empty shell over an error.
   if (failed) {
@@ -372,6 +440,13 @@ export function ArtistDetailPage() {
         streamCompleted={stream.completed}
         enrichment={payload.enrichment_coverage}
         watchlist={watchlistIdentity(payload)}
+        canFixMatches={canEnhance}
+        onMatchesChanged={() => {
+          // the hero badges come from the page payload, the chips from the
+          // enhanced one; a match change has to reach both
+          void query.refetch();
+          enhancedState.reload();
+        }}
       />
 
       <div className="artist-detail-content">
@@ -406,6 +481,7 @@ export function ArtistDetailPage() {
                   isMusicBrainz={isMusicBrainz}
                   isSourceArtist={sourceOnly}
                   onOpen={openRelease}
+                  onPlay={playRelease}
                 />
               ))}
               <ArtistVideosSection artistName={payload.artist?.name} />
@@ -415,6 +491,14 @@ export function ArtistDetailPage() {
           {/* Standard view only — the vanilla hid it in Enhanced. Mounted
               BEFORE loadSimilarArtists can run, or the loader finds no section
               and bails. */}
+          {/* Live dates and setlists. Renders nothing unless a concert
+              provider is configured, so it costs an unconfigured install
+              exactly one request that answers "not set up". */}
+          <ConcertsSection
+            artistName={String(payload?.artist?.name || '')}
+            mbid={String(payload?.artist?.musicbrainz_id || '')}
+          />
+
           <SimilarArtistsSection />
         </div>
       </div>

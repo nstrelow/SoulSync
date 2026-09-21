@@ -35,7 +35,17 @@ GONE = "gone"
 NOT_YET = "not_yet"
 # YouTube refused us specifically. Retryable, but usually needs yt-dlp updating.
 BLOCKED = "blocked"
-# Network hiccup, disk, timeout — the ordinary case the three-strike budget is for.
+# Needs a signed-in adult account. Retryable, but only once cookies exist.
+AGE_GATED = "age_gated"
+# YouTube wants to see a logged-in browser session. Same shape, different fix.
+COOKIES = "cookies"
+# We are being rate-limited. Says nothing about the video.
+THROTTLED = "throttled"
+# The download itself worked; merging/remuxing it did not (usually ffmpeg).
+POSTPROCESS = "postprocess"
+# Out of disk. Ours to fix, and nothing to do with this video.
+DISK = "disk"
+# Network hiccup, timeout — the ordinary case the three-strike budget is for.
 TRANSIENT = "transient"
 
 # yt-dlp colours its output; the raw string lands in the DB with the escapes intact.
@@ -69,6 +79,72 @@ _NOT_YET_PATTERNS = (
     "scheduled for",
 )
 
+# Ordered before BLOCKED because yt-dlp says "sign in to confirm your age" for
+# age gates and "sign in to confirm you're not a bot" for cookie problems, and the
+# generic 403 read would swallow both into one useless "update yt-dlp" message.
+_AGE_GATED_PATTERNS = (
+    "sign in to confirm your age",
+    "confirm your age",
+    "age-restricted",
+    "age restricted",
+    "inappropriate for some users",
+)
+
+# Deliberately NARROW. The bot gate — "Sign in to confirm you're not a bot. Use
+# --cookies-from-browser ..." — reads like a cookie problem and is not one: #1126
+# was a datacenter-IP block where the reporter re-exported cookies twice and it
+# changed nothing. That message stays BLOCKED, whose advice (update yt-dlp) is the
+# lever that actually moves. Only unambiguous "your cookies are the problem"
+# signals belong here.
+_COOKIES_PATTERNS = (
+    "cookies are no longer valid",
+    "invalid cookies",
+    "could not copy cookie",
+    "cookie file",
+    "login required",
+    "account authentication is required",
+    # yt-dlp failing to READ the configured cookie source. Not the same thing as
+    # YouTube rejecting us, and it classified as TRANSIENT — so the settings
+    # test said "the probe failed without a reason yt-dlp could classify, check
+    # app.log" about a fully explained, entirely fixable problem.
+    "cookies database",
+    "unsupported browser",
+    "failed to decrypt",
+    "could not decrypt",
+    "dpapi",
+)
+
+_THROTTLED_PATTERNS = (
+    "http error 429",
+    "429: too many requests",
+    "too many requests",
+    "rate limit",
+    "rate-limit",
+    "temporarily blocked",
+    "try again later",
+)
+
+# The bytes arrived. Something after that failed — almost always a missing or
+# broken ffmpeg, which is a local install problem, not a bad video.
+_POSTPROCESS_PATTERNS = (
+    "postprocessing:",
+    "ffmpeg not found",
+    "ffprobe and ffmpeg not found",
+    "you have requested merging",
+    "error opening output files",
+    "conversion failed",
+    "unable to rename file",
+    "audio conversion failed",
+)
+
+_DISK_PATTERNS = (
+    "no space left on device",
+    "errno 28",
+    "disk quota exceeded",
+    "insufficient disk space",
+    "not enough space",
+)
+
 _BLOCKED_PATTERNS = (
     "http error 403",
     "403: forbidden",
@@ -97,15 +173,41 @@ def classify(error: Any) -> str:
         return GONE
     if any(p in low for p in _NOT_YET_PATTERNS):
         return NOT_YET
+    # Our-side problems next: a full disk reported as "the video is blocked"
+    # sends the user to fix YouTube when the fix is on their own machine.
+    if any(p in low for p in _DISK_PATTERNS):
+        return DISK
+    if any(p in low for p in _POSTPROCESS_PATTERNS):
+        return POSTPROCESS
+    if any(p in low for p in _THROTTLED_PATTERNS):
+        return THROTTLED
+    # An age gate before the generic 403 read: yt-dlp phrases it as a sign-in
+    # prompt, and "update yt-dlp" does nothing for it.
+    if any(p in low for p in _AGE_GATED_PATTERNS):
+        return AGE_GATED
+    if any(p in low for p in _COOKIES_PATTERNS):
+        return COOKIES
     if any(p in low for p in _BLOCKED_PATTERNS):
         return BLOCKED
     return TRANSIENT
 
 
-def human_reason(error: Any) -> Optional[str]:
+def human_reason(error: Any, *, has_cookies: Optional[bool] = None,
+                 cookie_source: Optional[str] = None) -> Optional[str]:
     """What to show the user instead of a raw yt-dlp traceback, or None when we
     have nothing better to say than the original. The 403 message names yt-dlp on
-    purpose — five identical 'Forbidden' rows tell you nothing actionable."""
+    purpose — five identical 'Forbidden' rows tell you nothing actionable.
+
+    ``has_cookies`` is whether cookies are actually configured, when the caller
+    knows. It changes the BLOCKED advice, and it has to: "update yt-dlp" is the
+    right lever for a server with no cookies at all and the WRONG one for
+    somebody who has already pasted them. fabian42069 was told to update yt-dlp
+    (#1126), re-exported his cookies twice instead, and came back a fortnight
+    later with #1233 saying it had worked for a couple of days and then stopped
+    again — which is the signature of the export itself going stale, not of an
+    old yt-dlp. Left as ``None`` the wording is unchanged, so every existing
+    caller keeps the message it already had.
+    """
     low = _clean(error)
     kind = classify(error)
     if kind == GONE:
@@ -122,7 +224,70 @@ def human_reason(error: Any) -> Optional[str]:
         return "Gone from YouTube — removed, private or deleted."
     if kind == NOT_YET:
         return "Hasn't been released yet — SoulSync will keep checking."
+    if kind == AGE_GATED:
+        return ("Age-restricted — YouTube wants a signed-in adult account. Add browser "
+                "cookies in Settings to fetch this one.")
+    if kind == COOKIES:
+        # Reading the cookie SOURCE failed, which is a different problem from
+        # YouTube refusing the request and has a different fix.
+        if "cookies database" in low or "unsupported browser" in low or "decrypt" in low:
+            # Deliberately does NOT pick a cause. The first version of this
+            # asserted "SoulSync is running under WSL and your browser is a
+            # Windows install", which was a guess dressed as a diagnosis and
+            # was wrong for the first person who read it — he was running on
+            # Windows with Chrome open in front of him. List what it can be and
+            # let the raw yt-dlp line, which the caller appends, decide.
+            # Prefer what the user CONFIGURED over sniffing the error text: the
+            # DPAPI failure names no browser at all, so sniffing produced "the
+            # browser's cookies" for somebody who had plainly picked Chrome.
+            named = (str(cookie_source).strip().lower() or None) if cookie_source else None
+            if not named:
+                named = next((b for b in ("chrome", "firefox", "edge", "brave", "opera",
+                                          "chromium", "vivaldi", "safari") if b in low), None)
+            whose = f"{named.title()}'s" if named else "the browser's"
+
+            # A DPAPI failure is not one of three maybes. It IS Chromium's
+            # App-Bound Encryption, it cannot be configured around, and closing
+            # the browser does not help — so say that instead of a shrug.
+            if "dpapi" in low:
+                subject = f"{named.title()}'s" if named else "Those"
+                return (f"{subject} cookies are sealed with App-Bound Encryption, which "
+                        f"yt-dlp cannot read (yt-dlp issue 10927). Closing the browser will "
+                        f"not help and there is no setting that changes it. Use "
+                        f"'Paste cookies.txt' in Settings instead — export it with a "
+                        f"'Get cookies.txt LOCALLY' extension.")
+            return (f"SoulSync could not read {whose} cookies. Usually one of: the browser "
+                    f"is open and holding its cookie database (close it and retry); "
+                    f"Chrome and Edge 127+ encrypt cookies in a way yt-dlp cannot read at "
+                    f"all; or the browser is not reachable from wherever SoulSync itself "
+                    f"runs — a container, a headless box, or a Windows browser when "
+                    f"SoulSync runs under WSL. 'Paste cookies.txt' sidesteps all three.")
+        return ("YouTube asked us to prove we're not a bot. Add browser cookies in "
+                "Settings; updating yt-dlp alone won't clear this.")
+    if kind == THROTTLED:
+        return "YouTube is rate-limiting us. SoulSync will back off and try later."
+    if kind == POSTPROCESS:
+        return ("The video downloaded but couldn't be assembled — this is usually a "
+                "missing or broken ffmpeg on the server, not a problem with the video.")
+    if kind == DISK:
+        return "Out of disk space. Free some room and this will go straight through."
     if kind == BLOCKED:
+        if has_cookies:
+            # Do NOT drop the yt-dlp line here. I removed it this morning on the
+            # reasoning that somebody who already has cookies has been sent to
+            # the wrong lever — and then Boulder's own 403s turned out to be a
+            # 92-day-old yt-dlp plus cookies that YouTube wanted a PO token for.
+            # Both mattered, and the advice that would have fixed it was the one
+            # I had just taken away. "Has cookies" says nothing about whether
+            # yt-dlp is current.
+            return ("YouTube refused the download even though cookies are configured. "
+                    "Two things do this. An out-of-date yt-dlp is the common one — "
+                    "update it in Settings -> Advanced -> yt-dlp, and RESTART SoulSync "
+                    "afterwards, because the running process keeps the version it "
+                    "started with. The other is the cookies themselves: signed-in "
+                    "requests need a PO token that YouTube will not always issue, so "
+                    "setting cookies back to None often fixes downloads outright. On a "
+                    "server or VPS it can also simply be the IP being refused.")
         return ("YouTube refused the download. This is almost always an out-of-date "
                 "yt-dlp — update it with: pip install -U yt-dlp")
     return None
@@ -137,7 +302,12 @@ def failure_weight(error: Any, *, max_fail: int) -> int:
     kind = classify(error)
     if kind == GONE:
         return max(1, int(max_fail))
-    if kind == NOT_YET:
+    # Zero-weight failures say nothing about the video, so they must not spend its
+    # give-up budget. A full disk or a rate-limit window would otherwise blacklist
+    # everything queued while it lasted — permanently, long after the disk was
+    # cleared. strikes_for still counts them once they are older than the grace
+    # period, so a row that is STILL saying this a month later stops costing searches.
+    if kind in (NOT_YET, DISK, THROTTLED):
         return 0
     return 1
 
@@ -166,13 +336,70 @@ def strikes_for(rows: Iterable[Any], *, max_fail: int, not_yet_grace_days: int =
     return total
 
 
+# The kinds nothing will fix on its own: retrying changes nothing until a person
+# adds cookies, installs ffmpeg or frees disk. The UI uses this to separate "still
+# trying" from "waiting on you".
+_NEEDS_USER = frozenset({AGE_GATED, COOKIES, POSTPROCESS, DISK})
+
+
+def needs_user_action(error: Any) -> bool:
+    """Whether this failure is waiting on the operator rather than on time."""
+    return classify(error) in _NEEDS_USER
+
+
 def looks_like_stale_ytdlp(errors: Iterable[Any], *, threshold: int = 3) -> bool:
     """Whether a batch of failures reads as 'yt-dlp needs updating' rather than
     a scatter of unrelated problems. Used to say it once, loudly, instead of once
-    per video."""
+    per video.
+
+    Age gates and cookie prompts are deliberately NOT counted here any more: they
+    also produce a sign-in message, but updating yt-dlp fixes neither, and sending
+    the user to do that is how a cookie problem stays a cookie problem. Those get
+    their own cluster read below."""
     n = sum(1 for e in (errors or []) if classify(e) == BLOCKED)
     return n >= max(1, int(threshold))
 
 
+def dominant_failure(errors: Iterable[Any]) -> Optional[str]:
+    """The kind most worth naming out of a batch, or None for an empty batch.
+
+    'Most worth naming' is not 'most common': one full disk or one missing ffmpeg
+    is a standing problem the operator must act on, and it should not be drowned
+    out by a dozen ordinary timeouts. So the actionable kinds win, and only then
+    does frequency decide."""
+    kinds = [classify(e) for e in (errors or [])]
+    if not kinds:
+        return None
+    for kind in (DISK, POSTPROCESS, COOKIES, AGE_GATED, BLOCKED, THROTTLED, GONE, NOT_YET):
+        if kind in kinds:
+            return kind
+    return TRANSIENT
+
+
+def failure_summary(errors: Iterable[Any]) -> dict:
+    """``{kind: count}`` for a batch, plus what to tell the user about it.
+
+    Callers were each counting kinds by hand against a list that has since grown,
+    which is how the health tile ended up claiming it reported age and cookie
+    blocks while only ever counting the generic one."""
+    kinds: dict = {}
+    first_of: dict = {}
+    for e in (errors or []):
+        k = classify(e)
+        kinds[k] = kinds.get(k, 0) + 1
+        first_of.setdefault(k, e)
+    top = dominant_failure(errors)
+    return {
+        "counts": kinds,
+        "total": sum(kinds.values()),
+        "dominant": top,
+        "reason": human_reason(first_of[top]) if top in first_of else None,
+        "needs_user_action": any(k in _NEEDS_USER for k in kinds),
+    }
+
+
 __all__ = ["classify", "human_reason", "failure_weight", "strikes_for",
-           "looks_like_stale_ytdlp", "GONE", "NOT_YET", "BLOCKED", "TRANSIENT"]
+           "looks_like_stale_ytdlp", "needs_user_action", "dominant_failure",
+           "failure_summary",
+           "GONE", "NOT_YET", "BLOCKED", "TRANSIENT",
+           "AGE_GATED", "COOKIES", "THROTTLED", "POSTPROCESS", "DISK"]

@@ -92,6 +92,22 @@
         }
         return defaultSeasonNum(d && d.seasons);
     }
+    // Thumbnail width, not the original. An unsized /api/video/poster/... asks
+    // Plex for the full-size art - a ~2000x3000 poster decoded to ~24MB of
+    // bitmap and then scaled into a 150px card. A twenty-season rail did that
+    // twenty times over. Same helper the wishlist and watchlist grids use.
+    function sizedArt(url, w) {
+        if (!url) return url;
+        if (url.indexOf('/api/video/poster/') !== -1 || url.indexOf('/api/video/backdrop/') !== -1) {
+            return url + (url.indexOf('?') === -1 ? '?' : '&') + 'w=' + w;
+        }
+        if (url.indexOf('image.tmdb.org') !== -1) {
+            var b = w <= 185 ? 185 : (w <= 342 ? 342 : (w <= 500 ? 500 : 780));
+            return url.replace(/\/t\/p\/[^/]+\//, '/t/p/w' + b + '/');
+        }
+        return url;
+    }
+
     function seasonArt(s) {
         // tmdb + youtube carry direct (already-proxied for yt) art urls on the payload.
         if (data && (data.source === 'tmdb' || data.source === 'youtube')) return s.poster_url || data.poster_url || '';
@@ -161,6 +177,62 @@
             ? '<a class="artist-hero-badge" title="' + title + '" href="' + url + '" target="_blank" rel="noopener noreferrer">' + inner + '</a>'
             : '<div class="artist-hero-badge" title="' + title + '">' + inner + '</div>';
     }
+    function countLabel(n, one, many) {
+        n = Number(n) || 0;
+        return n + ' ' + (n === 1 ? one : many);
+    }
+    // one chip. mode is 'ok' (identity is there), 'missing' (a gap automation
+    // will trip over) or 'neutral' (a count, not a verdict).
+    function healthChip(label, value, mode) {
+        return '<span class="vd-health-chip vd-health-chip--' + mode + '">' +
+            '<span class="vd-health-k">' + esc(label) + '</span>' +
+            '<span class="vd-health-v">' + esc(value || 'Missing') + '</span></span>';
+    }
+    // a missing id isn't news, it's a job. `fix` is the enrichment service key,
+    // and the chip becomes the button that opens Manage on that service's match
+    // search. that repair flow already existed in the manage panel; nothing on
+    // the detail page pointed at it.
+    function idChip(label, value, fix) {
+        if (!value && fix) {
+            return '<button class="vd-health-chip vd-health-chip--missing vd-health-chip--fix" type="button" ' +
+                'data-vd-health-fix="' + esc(fix) + '" title="Find the right ' + esc(label) + ' match">' +
+                '<span class="vd-health-k">' + esc(label) + '</span>' +
+                '<span class="vd-health-v">Find\u2026</span></button>';
+        }
+        return healthChip(label, value, value ? 'ok' : 'missing');
+    }
+    // the band answers ONE question the hero can't: does automation have the ids
+    // it needs to go find this thing. owned/wanted, coverage and format facts all
+    // live in the meta line right above, so repeating them here just doubles the
+    // noise the band exists to cut.
+    function renderHealth(d) {
+        var h = q('[data-vd-health]');
+        if (!h) return;
+        if (!d) { h.hidden = true; h.innerHTML = ''; return; }
+        var chips = [];
+        if (d.source !== 'youtube') {
+            var libId = (d.source !== 'tmdb') ? d.id : d.library_id;
+            var fixable = libId != null;
+            if (!d.tmdb_id && fixable) chips.push(idChip('TMDB', d.tmdb_id, 'tmdb'));
+            if (d.kind === 'show' && !d.tvdb_id && fixable) chips.push(idChip('TVDB', d.tvdb_id, 'tvdb'));
+            if (!d.imdb_id && fixable) chips.push(idChip('IMDb', d.imdb_id, 'imdb'));
+        }
+        h.innerHTML = chips.join('');
+        h.hidden = !chips.length;
+    }
+    // Text colour to put ON the sampled accent. Dark Matter's poster is pale, so
+    // its accent sampled near-white and the Trailer button rendered white on
+    // white — an accent lifted from artwork cannot assume white text just
+    // because the page around it is dark. sRGB relative luminance, WCAG's.
+    function accentFg(rgb) {
+        var lin = [];
+        for (var i = 0; i < 3; i++) {
+            var v = rgb[i] / 255;
+            lin.push(v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+        }
+        var L = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+        return L > 0.45 ? '#0b0b0f' : '#fff';
+    }
 
     // ── accent extraction (poster → dominant vibrant colour) ──────────────────
     function applyAccent(img) {
@@ -179,7 +251,13 @@
                 if (score > bestScore) { bestScore = score; best = [r, g, b]; }
             }
             if (!best && n) best = [Math.round(fr / n), Math.round(fg / n), Math.round(fb / n)];
-            if (best) { var r0 = root(); if (r0) r0.style.setProperty('--vd-accent-rgb', best[0] + ', ' + best[1] + ', ' + best[2]); }
+            if (best) {
+                var r0 = root();
+                if (r0) {
+                    r0.style.setProperty('--vd-accent-rgb', best[0] + ', ' + best[1] + ', ' + best[2]);
+                    r0.style.setProperty('--vd-accent-fg', accentFg(best));
+                }
+            }
         } catch (e) { /* tainted/no image — keep theme accent */ }
     }
 
@@ -215,6 +293,21 @@
             poster.onload = function () { applyAccent(poster); };
             poster.src = posterUrl;
         }
+        var cover = q('[data-vd-cover]');
+        if (cover) {
+            var coverNeeded = !!posterUrl && (d.source === 'youtube' || (!d.logo && !d.has_backdrop));
+            cover.hidden = !coverNeeded;
+            cover.classList.toggle('vd-cover--channel', d.source === 'youtube' && d.kind === 'channel');
+            var bbContent = q('.vd-bb-content');
+            if (bbContent) bbContent.classList.toggle('vd-bb-content--no-cover', !coverNeeded);
+            if (coverNeeded) {
+                cover.src = sizedArt(posterUrl, d.source === 'youtube' ? 342 : 500);
+                cover.alt = d.source === 'youtube' ? ((d.title || 'Channel') + ' avatar') : ((d.title || 'Title') + ' poster');
+                cover.onerror = function () { cover.hidden = true; if (bbContent) bbContent.classList.add('vd-bb-content--no-cover'); };
+            } else {
+                cover.removeAttribute('src');
+            }
+        }
 
         var tl = q('[data-vd-tagline]');
         if (tl) { tl.textContent = d.tagline || ''; tl.hidden = !d.tagline; }
@@ -236,6 +329,8 @@
             }
             var mm = q('[data-vd-meta]'); if (mm) mm.innerHTML = meta.join('');
             renderActions(d);
+            renderHealth(d);
+            renderEssentials(d);
             var ll = q('[data-vd-links]'); if (ll) ll.innerHTML = '';
             var gg = q('[data-vd-genres]');
             if (gg) gg.innerHTML = (d.genres || []).slice(0, 8).map(genreChip).join('');
@@ -260,7 +355,13 @@
             // your best copy's format facts (4K · HDR · Atmos · 5.1), like the streamers show
             if (d.owned && d.file) meta.push.apply(meta, formatBadges(d.file));
         }
-        if (d.rating) meta.push('<span class="vd-score">★ ' + (Math.round(d.rating * 10) / 10) + '</span>');
+        // The ratings ROW below carries IMDb / RT / Metacritic / Trakt / TVmaze.
+        // Printing the TMDB score up here too put four numbers for one question
+        // two lines apart, disagreeing with each other. Only show it when the row
+        // below has nothing to say.
+        if (d.rating && !hasRatingRow(d)) {
+            meta.push('<span class="vd-score">★ ' + (Math.round(d.rating * 10) / 10) + '</span>');
+        }
         if (d.year) meta.push('<span>' + esc(d.year) + '</span>');
         if (d.content_rating) meta.push('<span class="vd-meta-rating">' + esc(d.content_rating) + '</span>');
         if (d.kind === 'show') {
@@ -280,6 +381,8 @@
         var m = q('[data-vd-meta]'); if (m) m.innerHTML = meta.join('');
 
         renderActions(d);
+        renderHealth(d);
+        renderEssentials(d);
 
         var l = q('[data-vd-links]');
         if (l && d.source === 'tmdb') {
@@ -312,6 +415,45 @@
         renderCast(d);
     }
 
+    function essentialChip(label, value, tone) {
+        if (value == null || value === '') return '';
+        return '<span class="vd-essential' + (tone ? ' vd-essential--' + tone : '') + '">' +
+            '<span class="vd-essential-k">' + esc(label) + '</span>' +
+            '<span class="vd-essential-v">' + esc(value) + '</span></span>';
+    }
+    function renderEssentials(d) {
+        var host = q('[data-vd-essentials]');
+        if (!host) return;
+        if (!d) { host.hidden = true; host.innerHTML = ''; return; }
+        var chips = [], yc = window.VideoYoutube;
+        if (d.source === 'youtube') {
+            chips.push(essentialChip('Loaded', countLabel(d.episode_total, 'video', 'videos'), 'focus'));
+            chips.push(essentialChip('Downloaded', countLabel(d.episode_owned, 'video', 'videos'), 'ok'));
+            if (d.kind === 'channel') {
+                var wished = ((d._channel && d._channel.videos) || []).filter(function (v) { return v.wished; }).length;
+                if (wished) chips.push(essentialChip('Wishlisted', countLabel(wished, 'video', 'videos'), 'focus'));
+                if (d.video_count && d.video_count > d.episode_total) chips.push(essentialChip('Catalog', 'Loading more', 'live'));
+            } else if (d.video_count && d.video_count > d.episode_total) {
+                chips.push(essentialChip('Shown', d.episode_total + ' of ' + d.video_count, 'live'));
+            }
+            var views = yc && yc.compactCount(d.view_count);
+            if (views) chips.push(essentialChip('Views', views, ''));
+        } else if (d.kind === 'show') {
+            var pctOwned = d.episode_total ? Math.round(d.episode_owned / d.episode_total * 100) : 0;
+            chips.push(essentialChip('Library', pctOwned + '% complete', pctOwned === 100 ? 'ok' : 'focus'));
+            if (d.next_up) {
+                chips.push(essentialChip('Next', 'S' + String(d.next_up.season_number).padStart(2, '0') +
+                    'E' + String(d.next_up.episode_number).padStart(2, '0'), 'live'));
+            }
+            if (d.status) chips.push(essentialChip('Status', statusLabel(d.status), ''));
+        } else {
+            if (d.file) chips.push(essentialChip('Best copy', fileSummary(d.file), 'live'));
+            else if (!d.owned) chips.push(essentialChip('Library', d.source === 'tmdb' ? 'Preview' : 'Wanted', 'focus'));
+            if (d.watched) chips.push(essentialChip('Watched', 'Yes', 'ok'));
+        }
+        host.innerHTML = chips.filter(Boolean).join('');
+        host.hidden = !chips.length;
+    }
     // OMDb Awards line ("Won 2 Oscars. 154 wins & 87 nominations total.") — the
     // overlay system already fetches it; the detail page finally shows it.
     function renderAwards(d) {
@@ -396,6 +538,13 @@
             (ne.name ? '<span class="vd-next-ep-name">' + esc(ne.name) + '</span>' : '') +
             '<span class="vd-next-ep-when">' + esc(fmtDate(ne.air_date)) + '</span>';
         el.hidden = false;
+    }
+
+    // Does the dedicated ratings row have anything in it? Drives whether the meta
+    // line needs to carry the score itself.
+    function hasRatingRow(d) {
+        return !!(d.imdb_rating || d.rt_rating != null || d.metacritic != null ||
+                  d.trakt_rating || d.tvmaze_rating);
     }
 
     function renderRatings(d) {
@@ -508,6 +657,11 @@
                 }).catch(function () { /* keep default state */ });
         }
         var html = '';
+        // Management actions (poster / metadata / sync / watched) collect here and
+        // ship behind one "More" button. Nine same-sized buttons in three rows gave
+        // "Play" and "Manage Poster" identical weight; these four are the ones you
+        // reach for occasionally, so they stop competing with the ones you don't.
+        var more = '';
         // Primary CTA: play it on your media server (owned items; arrives with
         // extras). The logo IS the brand name — "Play on <logo>" (no redundant word).
         if (d.server && d.server.url) {
@@ -622,7 +776,7 @@
         // new poster to) and a tmdb id (to fetch the alternates). Opens VideoPoster.
         var ownLibItem = (d.source !== 'tmdb') || d.owned;
         if (ownLibItem && d.tmdb_id && window.VideoPoster) {
-            html += '<button class="vd-manage-btn" type="button" data-vd-act="poster" title="Change poster">' +
+            more += '<button class="vd-manage-btn" type="button" data-vd-act="poster" title="Change poster">' +
                 '<span class="vd-trailer-ic">🖼</span> Manage Poster</button>';
         }
         // Manage — the per-item metadata editor (library items only: edits write
@@ -630,7 +784,7 @@
         // always have a row; TMDB pages only when owned (library_id resolves it).
         if (ownLibItem && window.VideoManage &&
                 (d.source !== 'tmdb' || d.library_id != null)) {
-            html += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="Edit metadata">' +
+            more += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="Edit metadata">' +
                 '<span class="vd-manage-ic">✎</span> Manage</button>';
         }
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
@@ -639,21 +793,58 @@
         var libShowId = (d.kind === 'show' && ownLibItem)
             ? (d.source !== 'tmdb' ? d.id : d.library_id) : null;
         if (libShowId != null) {
-            html += '<button class="vd-manage-btn" type="button" data-vd-act="sync-show" data-vd-sync-id="' + esc(libShowId) +
+            more += '<button class="vd-manage-btn" type="button" data-vd-act="sync-show" data-vd-sync-id="' + esc(libShowId) +
                 '" title="Re-read this show from your server — picks up new or removed episodes">' +
                 '<span class="vd-manage-ic">⟳</span> Sync</button>';
+        }
+        var libMovieId = (d.kind === 'movie' && ownLibItem)
+            ? (d.source !== 'tmdb' ? d.id : d.library_id) : null;
+        if (libMovieId != null) {
+            more += '<button class="vd-manage-btn" type="button" data-vd-act="sync-movie" data-vd-sync-id="' + esc(libMovieId) +
+                '" title="Re-read this movie from your server - updates file, watch, and metadata state">' +
+                '<span class="vd-manage-ic">âŸ³</span> Sync</button>';
         }
         // Watched toggle (the /watched API finally gets a UI): local state +
         // markPlayed/markUnplayed pushed to the server. Library rows only.
         if (ownLibItem && (d.kind === 'movie' || d.kind === 'show') &&
                 (d.source !== 'tmdb' || d.library_id != null) && (d.owned || d.episode_owned || d.watched)) {
-            html += '<button class="vd-manage-btn" type="button" data-vd-act="watched-toggle" title="' +
+            more += '<button class="vd-manage-btn" type="button" data-vd-act="watched-toggle" title="' +
                 (d.watched ? 'Mark unwatched (clears played state on your server too)'
                            : 'Mark watched (marks played on your server too)') + '">' +
                 '<span class="vd-manage-ic">' + (d.watched ? '↺' : '✓') + '</span> ' +
                 (d.watched ? 'Mark unwatched' : 'Mark watched') + '</button>';
         }
+        // One button instead of four. With a single item behind it the menu is
+        // pure overhead, so that item just rides in the main row.
+        if (more) {
+            html += (moreCount(more) === 1) ? more :
+                '<div class="vd-more" data-vd-more>' +
+                    '<button class="vd-manage-btn vd-more-btn" type="button" data-vd-act="more" ' +
+                        'aria-haspopup="true" aria-expanded="false" title="More actions">' +
+                        '<span class="vd-manage-ic">⋯</span> More</button>' +
+                    '<div class="vd-more-menu" data-vd-more-menu hidden>' + more + '</div>' +
+                '</div>';
+        }
         a.innerHTML = html;
+    }
+
+    function moreCount(html) { return (html.match(/<button/g) || []).length; }
+
+    function toggleMoreMenu(btn) {
+        var wrap = btn.closest('[data-vd-more]');
+        var menu = wrap && wrap.querySelector('[data-vd-more-menu]');
+        if (!menu) return;
+        var open = menu.hidden;
+        menu.hidden = !open;
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    function closeMoreMenu() {
+        var menu = q('[data-vd-more-menu]');
+        if (menu && !menu.hidden) {
+            menu.hidden = true;
+            var b = q('[data-vd-more] .vd-more-btn');
+            if (b) b.setAttribute('aria-expanded', 'false');
+        }
     }
 
     // Continue Watching: played/unplayed toggle → POST /detail/<kind>/<id>/watched
@@ -822,52 +1013,43 @@
             v.release_source ? prettySource(v.release_source) : ''].filter(Boolean).join(' · ');
     }
 
+    function detailCell(label, value) {
+        if (value == null || value === '') return '';
+        return '<div class="vd-detail-row"><span class="vd-detail-k">' + esc(label) +
+            '</span><span class="vd-detail-v">' + esc(value) + '</span></div>';
+    }
     function renderDetails(d) {
         var host = q('[data-vd-details]');
         if (!host) return;
         var rows = [];
-        if (d.release_date) rows.push(['Released', d.release_date]);
-        if (d.digital_release_date && d.digital_release_date !== d.release_date) {
-            rows.push(['Digital release', d.digital_release_date]);
-        }
-        if (d.runtime_minutes) rows.push(['Runtime', runtimeLabel(d.runtime_minutes)]);
-        if (d.studio) rows.push(['Studio', d.studio]);
-        if (d.status) rows.push(['Status', statusLabel(d.status)]);
-        if (d.rating_critic) rows.push(['Critic score', Math.round(d.rating_critic) + '%']);
-        // Your media — the technical specs we scanned (Plex-grade).
+        if (d.release_date) rows.push(detailCell('Released', d.release_date));
+        if (d.digital_release_date && d.digital_release_date !== d.release_date) rows.push(detailCell('Digital release', d.digital_release_date));
+        if (d.runtime_minutes) rows.push(detailCell('Runtime', runtimeLabel(d.runtime_minutes)));
+        if (d.studio) rows.push(detailCell('Studio', d.studio));
+        if (d.status) rows.push(detailCell('Status', statusLabel(d.status)));
+        if (d.rating_critic) rows.push(detailCell('Critic score', Math.round(d.rating_critic) + '%'));
         var f = d.file;
         if (f) {
-            // the ranked quality name when the grab recorded one (Radarr-style
-            // "WEBDL-1080p"), else the plain scanned resolution
-            if (f.quality || f.resolution) rows.push(['Quality', f.quality || mediaRes(f.resolution)]);
-            if (f.video_codec) rows.push(['Video', prettyCodec(f.video_codec)]);
-            if (f.dynamic_range) rows.push(['Dynamic range', f.dynamic_range]);
-            if (f.audio_codec || f.audio_channels || f.atmos) {
-                rows.push(['Audio', [String(f.audio_codec || '').toUpperCase(),
-                    channelsLabel(f.audio_channels), f.atmos ? 'Atmos' : '']
-                    .filter(Boolean).join(' · ')]);
-            }
-            if (f.release_source) rows.push(['Source', prettySource(f.release_source)]);
-            if (f.size_bytes) rows.push(['Size', fmtBytes(f.size_bytes)]);
+            if (f.quality || f.resolution) rows.push(detailCell('Quality', f.quality || mediaRes(f.resolution)));
+            if (f.video_codec) rows.push(detailCell('Video', prettyCodec(f.video_codec)));
+            if (f.dynamic_range) rows.push(detailCell('Dynamic range', f.dynamic_range));
+            var audio = [String(f.audio_codec || '').toUpperCase(), channelsLabel(f.audio_channels), f.atmos ? 'Atmos' : '']
+                .filter(Boolean).join(' · ');
+            if (audio) rows.push(detailCell('Audio', audio));
+            if (f.release_source) rows.push(detailCell('Source', prettySource(f.release_source)));
+            if (f.size_bytes) rows.push(detailCell('Size', fmtBytes(f.size_bytes)));
         }
-        var html = rows.length
-            ? '<div class="vd-detail-grid">' + rows.map(function (r) {
-                return '<div class="vd-detail-row"><span class="vd-detail-k">' + esc(r[0]) +
-                    '</span><span class="vd-detail-v">' + esc(r[1]) + '</span></div>';
-            }).join('') + '</div>'
-            : '';
-        // Multiple versions / editions you own.
+        var html = rows.length ? '<div class="vd-detail-grid">' + rows.join('') + '</div>' : '';
         var files = d.files || [];
         if (files.length > 1) {
-            html += '<div class="vd-versions"><div class="vd-versions-h">' + files.length + ' versions</div>' +
-                files.map(function (v) {
-                    return '<div class="vd-version">' + esc(fileSummary(v)) + '</div>';
+            html += '<div class="vd-versions"><div class="vd-versions-h">Versions you own</div>' +
+                files.map(function (v, i) {
+                    return '<div class="vd-version"><span class="vd-version-rank">' + (i + 1) + '</span>' +
+                        '<span>' + esc(fileSummary(v)) + '</span></div>';
                 }).join('') + '</div>';
         }
         host.innerHTML = html;
-    }
-
-    // ── per-title acquisition history (arr-parity P9) ─────────────────────────
+    }    // ── per-title acquisition history (arr-parity P9) ─────────────────────────
     // Every grab/import/upgrade/failure this title has ever had, from the
     // permanent archive. Library-source pages only (the id keys the lookup).
     var _HIST_OUTCOME = {
@@ -876,6 +1058,70 @@
         failed: ['Failed', 'vd-hist-chip--bad'],
         cancelled: ['Cancelled', 'vd-hist-chip--mut'],
     };
+    // The six states, in the order you'd read them: what you have, what is
+    // being fetched, what is stuck, what nothing is chasing. queued/downloading
+    // are a SUBSET of wanted (a wished episode mid-grab is still wished), so
+    // they sit inside the wanted chip's own line rather than beside it.
+    var _ACQ_STATES = [
+        ['owned', 'Owned', 'vd-acq-chip--ok'],
+        ['wanted', 'Wanted', 'vd-acq-chip--want'],
+        ['queued', 'Queued', 'vd-acq-chip--live'],
+        ['downloading', 'Downloading', 'vd-acq-chip--live'],
+        ['failed', 'Failed', 'vd-acq-chip--bad'],
+        ['ignored', 'Ignored', 'vd-acq-chip--mut'],
+    ];
+    function acqPanelHtml(state) {
+        var c = (state && state.counts) || {};
+        var total = Number(state && state.total) || 0;
+        var owned = Number(c.owned) || 0;
+        var wanted = Number(c.wanted) || 0;
+        var live = (Number(c.queued) || 0) + (Number(c.downloading) || 0);
+        var failed = Number(c.failed) || 0;
+        var ignored = Number(c.ignored) || 0;
+        var outstanding = total > 0 ? Math.max(0, total - owned) : 0;
+        if (!failed && !live && !ignored && !outstanding) return '';
+        var shown = _ACQ_STATES.filter(function (s) {
+            if (s[0] === 'owned' && !owned) return false;
+            if (s[0] === 'wanted' && !outstanding && wanted <= owned) return false;
+            return (Number(c[s[0]]) || 0) > 0;
+        });
+        if (!shown.length) return '';
+        var pctOwned = total > 0 ? Math.round(owned / total * 100) : 0;
+        var headline = failed ? (failed + ' stuck')
+            : live ? (live + ' moving')
+            : outstanding ? (outstanding + ' missing')
+            : ignored ? (ignored + ' ignored')
+            : 'Needs attention';
+        var sub = total > 0 ? (owned + ' of ' + total + ' in library') : 'Tracked by acquisition';
+        var bar = total > 0 && owned < total
+            ? '<div class="vd-acq-bar" title="' + owned + ' of ' + total + ' in library">' +
+                '<span class="vd-acq-bar-fill" style="width:' + pctOwned + '%"></span></div>'
+            : '';
+        return '<div class="vd-acq-card"><div class="vd-acq-summary">' +
+            '<span class="vd-acq-eyebrow">Needs attention</span>' +
+            '<strong>' + esc(headline) + '</strong><span>' + esc(sub) + '</span></div>' +
+            '<div class="vd-acq-chips">' + shown.map(function (s) {
+                return '<span class="vd-acq-chip ' + s[2] + '">' +
+                    '<span class="vd-acq-n">' + (Number(c[s[0]]) || 0) + '</span>' +
+                    '<span class="vd-acq-k">' + esc(s[1]) + '</span></span>';
+            }).join('') + '</div>' + bar +
+            (live ? '<div class="vd-acq-note">Queued and downloading are part of wanted, not extra to it.</div>' : '') +
+            '</div>';
+    }
+    function loadAcquisition(kind, id) {
+        var section = q('[data-vd-acq-section]'), host = q('[data-vd-acq]');
+        if (!section || !host) return;
+        fetch('/api/video/detail/' + kind + '/' + id + '/acquisition',
+              { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                var html = (d && d.success) ? acqPanelHtml(d) : '';
+                host.innerHTML = html;
+                section.hidden = !html;
+            })
+            .catch(function () { section.hidden = true; });
+    }
+
     function loadTitleHistory(kind, id) {
         var section = q('[data-vd-history-section]'), host = q('[data-vd-history]');
         if (!section || !host) return;
@@ -909,7 +1155,8 @@
         ['[data-vd-providers-section]', '[data-vd-similar-section]', '[data-vd-collection-section]',
          '[data-vd-next-ep]', '[data-vd-crew-line]', '[data-vd-season-overview]',
          '[data-vd-facts-section]', '[data-vd-videos-section]', '[data-vd-gallery-section]',
-         '[data-vd-review-section]', '[data-vd-cast-all]', '[data-vd-history-section]'].forEach(function (s) {
+         '[data-vd-review-section]', '[data-vd-cast-all]', '[data-vd-history-section]', '[data-vd-health]',
+         '[data-vd-acq-section]', '[data-vd-essentials]'].forEach(function (s) {
             var n = q(s); if (n) n.hidden = true;
         });
         // Clear any YouTube-channel playlists from the show DOM so they don't leak
@@ -1384,7 +1631,7 @@
             var oe = fb
                 ? 'var f=this.getAttribute(\'data-fb\');if(f){this.removeAttribute(\'data-fb\');this.src=f;}else{this.style.display=\'none\';}'
                 : 'this.style.display=\'none\'';
-            var img = art ? '<img class="vd-rcard-img" src="' + art + '" alt="" loading="lazy"' +
+            var img = art ? '<img class="vd-rcard-img" src="' + sizedArt(art, 342) + '" alt="" loading="lazy"' +
                 (fb ? ' data-fb="' + esc(fb) + '"' : '') + ' onerror="' + oe + '">' : '';
             return '<button class="vd-rcard' + on + '" type="button" data-vd-season="' + s.season_number + '">' +
                 '<div class="vd-rcard-art">' + img + '<div class="vd-rcard-fb">📺</div>' +
@@ -1444,6 +1691,13 @@
         if (ep.like_count) { meta.push('👍 ' + (yc0 ? yc0.compactCount(ep.like_count) : ep.like_count)); }
         if (ep.dislike_count) { meta.push('👎 ' + (yc0 ? yc0.compactCount(ep.dislike_count) : ep.dislike_count)); }
         if (ep.air_date) meta.push(fmtDate(ep.air_date));
+        // the id the downloader keys on, and the only way to check a video by hand
+        // when a grab fails. data-vd-ext lets the root click handler pass it through.
+        var vidChip = ep.youtube_id
+            ? '<a class="vd-ep-vid" data-vd-ext target="_blank" rel="noopener" ' +
+                'href="https://www.youtube.com/watch?v=' + encodeURIComponent(ep.youtube_id) + '" ' +
+                'title="Open on YouTube">YouTube</a>'
+            : '';
         var wished = !!ep.wished;
         // Downloaded videos wear the SAME owned treatment as TV episodes (.vd-ep--owned
         // + badge) but KEEP the direct-download button: a server-side delete leaves the
@@ -1454,7 +1708,8 @@
             still + '<span class="vd-ep-thumb-ic">▶</span>' + dur + '</div>' +
             '<div class="vd-ep-info"><div class="vd-ep-top"><span class="vd-ep-title">' +
             esc(ep.title || 'Untitled') + '</span>' +
-            (meta.length ? '<span class="vd-ep-rt">' + esc(meta.join(' · ')) + '</span>' : '') + '</div>' +
+            (meta.length ? '<span class="vd-ep-rt">' + esc(meta.join(' · ')) + '</span>' : '') +
+            vidChip + '</div>' +
             (ep.overview ? '<p class="vd-ep-desc">' + esc(ep.overview) + '</p>' : '') + '</div>' +
             (ep.owned ? '<div class="vd-ep-get" data-vd-ep-get="' + esc(ep.youtube_id) + '">' +
                             '<span class="vd-ep-dl" data-vd-ep-dl></span>' +
@@ -1509,7 +1764,7 @@
             ? (ep.still_url || '')
             : (ep.has_still ? '/api/video/poster/episode/' + ep.id : '');
         var still = stillSrc
-            ? '<img class="vd-ep-still" src="' + stillSrc + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+            ? '<img class="vd-ep-still" src="' + sizedArt(stillSrc, 342) + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
             : '';
         if (ep.rating) meta.push('★ ' + (Math.round(ep.rating * 10) / 10));
         var key = selectedSeason + '_' + ep.episode_number;
@@ -1617,15 +1872,26 @@
         return links.length
             ? '<div class="vd-ep-links">' + links.join('') + '</div>' : '';
     }
+    // How many guest faces the expanded episode shows before folding the rest
+    // away. One episode came back with fourteen, most of them a grey initial in a
+    // circle, and they out-shouted the episode's own actions.
+    var GUEST_VISIBLE = 8;
+
     function renderEpisodeExtra(panel, ex, showTmdb, season, episode) {
-        var html = '';
-        if (ex.still_url) {
-            html += '<img class="vd-ep-extra-still" src="' + esc(ex.still_url) + '" alt="" loading="lazy">';
+        // The row above already prints this description and TMDB hands back the
+        // same string, so printing it again just doubled the panel's height.
+        var owner = panel.previousElementSibling;
+        var rowDesc = '';
+        if (owner && owner.classList && owner.classList.contains('vd-ep')) {
+            var dEl = owner.querySelector('.vd-ep-desc');
+            rowDesc = dEl ? (dEl.textContent || '').trim() : '';
         }
-        html += '<div class="vd-ep-extra-body">';
-        if (ex.overview) html += '<p class="vd-ep-extra-ov">' + esc(ex.overview) + '</p>';
+        var body = '';
+        if (ex.overview && ex.overview.trim() !== rowDesc) {
+            body += '<p class="vd-ep-extra-ov">' + esc(ex.overview) + '</p>';
+        }
         if (ex.guest_stars && ex.guest_stars.length) {
-            html += '<div class="vd-ep-extra-gh">Guest stars</div><div class="vd-ep-guests">' +
+            body += '<div class="vd-ep-extra-gh">Guest stars</div><div class="vd-ep-guests">' +
                 ex.guest_stars.map(function (g) {
                     var img = g.photo
                         ? '<img class="vd-guest-photo" src="' + esc(g.photo) + '" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
@@ -1635,11 +1901,24 @@
                     return g.tmdb_id
                         ? '<a class="vd-guest" href="/video-detail/tmdb/person/' + g.tmdb_id + '" data-vd-person="' + g.tmdb_id + '">' + inner + '</a>'
                         : '<div class="vd-guest">' + inner + '</div>';
-                }).join('') + '</div>';
+                }).join('') +
+                (ex.guest_stars.length > GUEST_VISIBLE
+                    ? '<button class="vd-guest-more" type="button" data-vd-guests-all>+' +
+                      (ex.guest_stars.length - GUEST_VISIBLE) + ' more</button>'
+                    : '') +
+                '</div>';
         }
-        html += episodeLinks(showTmdb, season, episode, ex);
-        html += '</div>';
-        panel.innerHTML = html || '<div class="vd-ep-extra-empty">No extra info.</div>';
+        body += episodeLinks(showTmdb, season, episode, ex);
+        // The empty-state used to be unreachable: the old code built the wrapper
+        // div into `html` first, so `html || fallback` could never take the
+        // fallback and an episode with no extras opened into a blank box.
+        panel.innerHTML =
+            (ex.still_url
+                ? '<img class="vd-ep-extra-still" src="' + esc(ex.still_url) + '" alt="" loading="lazy">'
+                : '') +
+            '<div class="vd-ep-extra-body">' +
+                (body || '<div class="vd-ep-extra-empty">No extra info.</div>') +
+            '</div>';
     }
 
     function renderSeasonOverview() {
@@ -1651,6 +1930,56 @@
         el.hidden = !ov;
     }
 
+    // Season-level action bar. Acquisition (grab / manual search / wishlist)
+    // only when something is missing; monitoring and stale-failure resets on any
+    // library season, complete or not. Returns '' when there is nothing to offer.
+    function seasonActionsHtml(season) {
+        var isYt = !!(data && data.source === 'youtube');
+        var seasonMissing = season.episodes.filter(function (e) { return !e.owned; });
+        if (isYt && (ytFilter.q || ytFilter.state !== 'all' || ytFilter.duration !== 'all')) seasonMissing = [];   // a filtered view isn't "the season"
+        var canAcquire = !!(seasonMissing.length && (isYt || window.VideoGrab));
+        // Monitoring and stale-failure resets matter on a COMPLETE season too, so a
+        // library show always gets the bar. YouTube never does: it has no episode
+        // rows to monitor, and a preview has no library row to act on at all.
+        var seasonManage = !isYt && !!data && data.kind === 'show' && data.source !== 'tmdb';
+        var monitored = (Number(season.episode_monitored) || 0) > 0;
+        return (canAcquire || seasonManage)
+            ? '<div class="vd-season-actions">' +
+                (canAcquire ? '<span class="vd-season-actions-count">' + seasonMissing.length + ' missing</span>' : '') +
+                (canAcquire ?
+                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-grab ' +
+                    'title="' + (isYt ? 'Download every missing video in this year'
+                                      : 'Auto-search &amp; download every missing episode in this season') + '">' +
+                    '<span class="discog-btn-icon">⭳</span><span class="discog-btn-text">Grab ' + (isYt ? 'year' : 'season') + '</span>' +
+                    '<span class="discog-btn-shimmer"></span></button>' : '') +
+                (canAcquire && !isYt ?
+                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-search ' +
+                    'title="Manual search — pick releases for this season">' +
+                    '<span class="discog-btn-icon">⌕</span><span class="discog-btn-text">Manual search</span>' +
+                    '<span class="discog-btn-shimmer"></span></button>' : '') +
+                (canAcquire ?
+                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-wish ' +
+                    'title="' + (isYt ? 'Add every missing video in this year to the wishlist'
+                                      : 'Add every missing episode in this season to the wishlist') + '">' +
+                    '<span class="discog-btn-icon">＋</span><span class="discog-btn-text">Wishlist ' + (isYt ? 'year' : 'season') + '</span>' +
+                    '<span class="discog-btn-shimmer"></span></button>' : '') +
+                (seasonManage ?
+                '<button class="discog-download-btn discog-btn-compact vd-season-mon' + (monitored ? ' vd-season-mon--on' : '') +
+                    '" type="button" data-vd-season-monitor="' + (monitored ? '0' : '1') + '" ' +
+                    'title="' + (monitored ? 'Stop hunting this season'
+                                           : 'Hunt missing episodes in this season again') + '">' +
+                    '<span class="discog-btn-icon">' + (monitored ? '◉' : '○') + '</span>' +
+                    '<span class="discog-btn-text">' + (monitored ? 'Monitored' : 'Unmonitored') + '</span>' +
+                    '<span class="discog-btn-shimmer"></span></button>' : '') +
+                (seasonManage && data.tmdb_id ?
+                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-clearfail ' +
+                    'title="Clear retry backoff on this season\u2019s stalled wishlist rows and search every source again">' +
+                    '<span class="discog-btn-icon">↺</span><span class="discog-btn-text">Clear failures</span>' +
+                    '<span class="discog-btn-shimmer"></span></button>' : '') +
+              '</div>'
+            : '';
+    }
+
     function renderEpisodes() {
         renderSeasonOverview();
         var host = q('[data-vd-episodes]');
@@ -1659,34 +1988,9 @@
         if (!season) { host.innerHTML = ''; return; }
         var eps = missingOnly ? season.episodes.filter(function (e) { return !e.owned; }) : season.episodes;
         var emptyMsg = (data && data.source === 'youtube')
-            ? (ytFilter.q ? 'No videos match “' + esc(ytFilter.q) + '”.' : 'No videos here.')
+            ? (ytFilter.q || ytFilter.state !== 'all' || ytFilter.duration !== 'all' ? 'No videos match these filters.' : 'No videos here.')
             : 'No ' + (missingOnly ? 'missing ' : '') + 'episodes here. 🎉';
-        // Season-level acquisition bar — grab / wishlist every missing episode in
-        // one click. Channels get the SAME bar (TV parity), minus manual search:
-        // there's no release to pick on YouTube, the video is the release.
-        var isYt = !!(data && data.source === 'youtube');
-        var seasonMissing = season.episodes.filter(function (e) { return !e.owned; });
-        if (isYt && ytFilter.q) seasonMissing = [];   // a filtered view isn't "the season"
-        var seasonBar = (seasonMissing.length && (isYt || window.VideoGrab))
-            ? '<div class="vd-season-actions">' +
-                '<span class="vd-season-actions-count">' + seasonMissing.length + ' missing</span>' +
-                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-grab ' +
-                    'title="' + (isYt ? 'Download every missing video in this year'
-                                      : 'Auto-search &amp; download every missing episode in this season') + '">' +
-                    '<span class="discog-btn-icon">⭳</span><span class="discog-btn-text">Grab ' + (isYt ? 'year' : 'season') + '</span>' +
-                    '<span class="discog-btn-shimmer"></span></button>' +
-                (isYt ? '' :
-                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-search ' +
-                    'title="Manual search — pick releases for this season">' +
-                    '<span class="discog-btn-icon">⌕</span><span class="discog-btn-text">Manual search</span>' +
-                    '<span class="discog-btn-shimmer"></span></button>') +
-                '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-wish ' +
-                    'title="' + (isYt ? 'Add every missing video in this year to the wishlist'
-                                      : 'Add every missing episode in this season to the wishlist') + '">' +
-                    '<span class="discog-btn-icon">＋</span><span class="discog-btn-text">Wishlist ' + (isYt ? 'year' : 'season') + '</span>' +
-                    '<span class="discog-btn-shimmer"></span></button>' +
-              '</div>'
-            : '';
+        var seasonBar = seasonActionsHtml(season);
         host.innerHTML = seasonBar +
             (eps.length ? eps.map(episodeRow).join('') : '<div class="vd-ep-empty">' + emptyMsg + '</div>');
         host.classList.remove('vd-ep-anim'); void host.offsetWidth; host.classList.add('vd-ep-anim');
@@ -1852,6 +2156,7 @@
                     maybeRefreshMovie(id);
                     loadExtras('movie', id);
                     loadTitleHistory('movie', id);    // acquisition history (P9)
+                    loadAcquisition('movie', id);        // ...and where it stands now
                     watchMovieDownload(id);           // live download progress chip (if any)
                 }
             })
@@ -1927,6 +2232,7 @@
                     maybeRefreshArt(id);
                     loadExtras('show', id);
                     loadTitleHistory('show', id);     // acquisition history (P9)
+                    loadAcquisition('show', id);        // ...and where it stands now
                 }
             })
             .catch(function () { showLoading(false); setText('[data-vd-title]', 'Could not load show'); });
@@ -1969,6 +2275,51 @@
 
     // Per-show Synchronize (server re-read). Synchronous on the backend (one
     // show reads in seconds); the response says exactly what changed.
+    function syncMovieNow(btn) {
+        var id = btn.getAttribute('data-vd-sync-id');
+        if (!id || btn.disabled) return;
+        btn.disabled = true;
+        var orig = btn.innerHTML;
+        btn.innerHTML = '<span class="vd-manage-ic">âŸ³</span> Syncingâ€¦';
+        fetch('/api/video/detail/movie/' + encodeURIComponent(id) + '/sync', { method: 'POST' })
+            .then(function (r) { return r.json().catch(function () { return { success: false, error: 'HTTP ' + r.status }; }); })
+            .then(function (d) {
+                btn.disabled = false;
+                btn.innerHTML = orig;
+                if (!d || !d.success) {
+                    if (typeof showToast === 'function') showToast(d && d.error ? d.error : 'Sync failed', 'error');
+                    return;
+                }
+                if (d.movie_removed) {
+                    if (typeof showToast === 'function') showToast('"' + (d.title || 'Movie') + '" is no longer on your server - removed from the library', 'warning');
+                    document.dispatchEvent(new CustomEvent('soulsync:video-navigate', { detail: 'video-library' }));
+                    return;
+                }
+                var bits = [];
+                if (d.files_added) bits.push('+' + d.files_added + ' file' + (d.files_added !== 1 ? 's' : ''));
+                if (d.files_removed) bits.push('-' + d.files_removed + ' file' + (d.files_removed !== 1 ? 's' : ''));
+                if (typeof showToast === 'function') {
+                    var refreshBad = d.metadata_refresh && d.metadata_refresh !== 'ok';
+                    if (refreshBad) {
+                        showToast('Synchronized' + (bits.length ? ': ' + bits.join(', ') : '') +
+                            ' - metadata refresh failed (' + d.metadata_refresh + ')', 'warning');
+                    } else {
+                        showToast('Synchronized' + (bits.length ? ': ' + bits.join(', ') : ' - no changes'), 'success');
+                    }
+                }
+                var rid = parseInt(d.movie_id != null ? d.movie_id : id, 10);
+                if (!isNaN(rid)) {
+                    if (d.rekeyed) { currentId = rid; }
+                    if (currentId === rid) loadMovie(rid, 'library');
+                }
+            })
+            .catch(function () {
+                btn.disabled = false;
+                btn.innerHTML = orig;
+                if (typeof showToast === 'function') showToast('Sync failed - could not reach the server', 'error');
+            });
+    }
+
     function syncShowNow(btn) {
         var id = btn.getAttribute('data-vd-sync-id');
         if (!id || btn.disabled) return;
@@ -2047,7 +2398,7 @@
     // d.source='youtube' driving every branch above. All TMDB-only sections
     // auto-hide on empty channel data.
     var ytVideoMap = {};   // youtube_id -> raw video (for wish add, main grid + playlists)
-    var ytFilter = { q: '', sort: 'newest' };   // channel search + sort
+    var ytFilter = { q: '', sort: 'newest', state: 'all', duration: 'all' };   // channel search + sort + facets
     var ytSearchTimer = null;
 
     function ytProx(u) { return (window.VideoYoutube && u) ? VideoYoutube.img(u) : (u || ''); }
@@ -2066,6 +2417,12 @@
             still_url: ytProx(v.thumbnail_url), youtube_id: v.youtube_id,
             yt_duration: v.duration || '', view_count: v.view_count || 0,
             like_count: v.like_count || 0, dislike_count: v.dislike_count || 0 };
+    }
+    // how many of these videos are actually on disk. three builders used to
+    // hardcode 0 here, which the season pills showed as "0 / N eps" and the
+    // health band showed as "0 downloads" on a playlist you'd fully grabbed.
+    function ytOwnedCount(vids) {
+        return (vids || []).filter(function (v) { return v.downloaded; }).length;
     }
     function ytDurSecs(d) {
         if (!d) return 0;
@@ -2088,20 +2445,32 @@
             for (var k = 0; k < vids.length; k++) { if (vids[k].thumbnail_url) { thumb = vids[k].thumbnail_url; break; } }
             var poster = thumb ? ytProx(ytHiRes(thumb)) : '';        // maxres for the rail card
             var eps = vids.map(ytEpisodeOf);
-            var wishedN = eps.filter(function (e) { return e.owned; }).length;
+            var ownedN = eps.filter(function (e) { return e.owned; }).length;
             var label = yr ? String(yr) : (years.length === 1 ? 'All Videos' : 'Earlier videos');
             return { season_number: yr, title: label, poster_url: poster || ytProx(ch.avatar_url),
                 poster_fallback: thumb ? ytProx(thumb) : '',         // ← if maxres 404s
-                episode_owned: wishedN, episode_total: eps.length, episodes: eps };
+                episode_owned: ownedN, episode_total: eps.length, episodes: eps };
         });
     }
     // A search OR a popularity/length sort collapses the year view into one flat,
     // sorted "results" list instead of per-year seasons.
-    function ytFlatMode() { return !!ytFilter.q || ytFilter.sort === 'views' || ytFilter.sort === 'longest'; }
+    function ytFlatMode() { return !!ytFilter.q || ytFilter.state !== 'all' || ytFilter.duration !== 'all' || ytFilter.sort === 'views' || ytFilter.sort === 'longest'; }
     function ytVisibleVideos() {
         var all = (data && data._channel && data._channel.videos) || [];
         var q = (ytFilter.q || '').toLowerCase().trim();
         var vids = q ? all.filter(function (v) { return (v.title || '').toLowerCase().indexOf(q) >= 0; }) : all.slice();
+        if (ytFilter.state === 'downloaded') vids = vids.filter(function (v) { return v.downloaded; });
+        else if (ytFilter.state === 'missing') vids = vids.filter(function (v) { return !v.downloaded; });
+        else if (ytFilter.state === 'wished') vids = vids.filter(function (v) { return v.wished; });
+        if (ytFilter.duration !== 'all') {
+            vids = vids.filter(function (v) {
+                var s = ytDurSecs(v.duration);
+                if (!s) return false;
+                if (ytFilter.duration === 'short') return s < 60;
+                if (ytFilter.duration === 'standard') return s >= 60 && s < 1200;
+                return s >= 1200;
+            });
+        }
         if (ytFilter.sort === 'views') vids.sort(function (a, b) { return (b.view_count || 0) - (a.view_count || 0); });
         else if (ytFilter.sort === 'longest') vids.sort(function (a, b) { return ytDurSecs(b.duration) - ytDurSecs(a.duration); });
         else if (ytFilter.sort === 'oldest') vids.sort(function (a, b) { var x = a.published_at || '￿', y = b.published_at || '￿'; return x < y ? -1 : x > y ? 1 : 0; });
@@ -2113,7 +2482,7 @@
         var title = ytFilter.q ? (vids.length + ' result' + (vids.length === 1 ? '' : 's'))
             : (ytFilter.sort === 'views' ? 'Most viewed' : 'Longest');
         return { season_number: -1, title: title, poster_url: ytProx(ch.avatar_url),
-            episode_owned: 0, episode_total: vids.length, episodes: vids.map(ytEpisodeOf) };
+            episode_owned: ytOwnedCount(vids), episode_total: vids.length, episodes: vids.map(ytEpisodeOf) };
     }
     function ytRebuildMap() {
         ytVideoMap = {};
@@ -2136,6 +2505,11 @@
         }
         data.season_count = data.seasons.length;
         data.episode_total = (data._channel.videos || []).length;
+        // count off the MASTER list, not the seasons: a search filters the
+        // seasons, and the band must not read as "your downloads vanished".
+        data.episode_owned = ytOwnedCount(data._channel.videos);
+        renderHealth(data);
+        renderEssentials(data);
         renderSeasonNav();
         var nowObj = seasonByNum(selectedSeason);
         if (force || selectedSeason !== prevSel || !nowObj || nowObj.episodes.length !== prevEp) renderEpisodes();
@@ -2145,17 +2519,35 @@
         var inp = q('[data-vd-yt-search]');
         if (inp && document.activeElement !== inp) { var v = inp.value; inp.focus(); inp.value = ''; inp.value = v; }
     }
+    function ytFacetBtn(group, value, label) {
+        var active = ytFilter[group] === value;
+        return '<button class="vd-yt-facet' + (active ? ' vd-yt-facet--active' : '') + '" type="button" ' +
+            'data-vd-yt-filter="' + group + '" data-vd-yt-filter-value="' + value + '">' + esc(label) + '</button>';
+    }
     function ytControlsHTML() {
         var sorts = [['newest', 'Newest'], ['oldest', 'Oldest'], ['views', 'Most viewed'], ['longest', 'Longest']];
+        var total = (data && data._channel && data._channel.videos && data._channel.videos.length) || 0;
+        var filtered = ytVisibleVideos().length;
+        var counts = total ? '<div class="vd-yt-counts"><strong>' + filtered + '</strong><span>of ' + total + ' loaded</span></div>' : '';
         return '<div class="vd-yt-controls">' +
             '<div class="vd-yt-search"><span class="vd-yt-search-ic">⌕</span>' +
             '<input class="vd-yt-search-in" type="text" placeholder="Search this channel…" value="' +
             esc(ytFilter.q) + '" data-vd-yt-search></div>' +
             '<select class="vd-yt-sort" data-vd-yt-sort>' + sorts.map(function (s) {
                 return '<option value="' + s[0] + '"' + (ytFilter.sort === s[0] ? ' selected' : '') + '>' + esc(s[1]) + '</option>';
-            }).join('') + '</select></div>';
+            }).join('') + '</select>' + counts + '</div>' +
+            '<div class="vd-yt-facets" aria-label="Channel video filters">' +
+                ytFacetBtn('state', 'all', 'All') +
+                ytFacetBtn('state', 'missing', 'Not downloaded') +
+                ytFacetBtn('state', 'downloaded', 'Downloaded') +
+                ytFacetBtn('state', 'wished', 'Wishlisted') +
+                '<span class="vd-yt-facet-sep"></span>' +
+                ytFacetBtn('duration', 'all', 'Any length') +
+                ytFacetBtn('duration', 'short', 'Shorts') +
+                ytFacetBtn('duration', 'standard', 'Standard') +
+                ytFacetBtn('duration', 'long', 'Long-form') +
+            '</div>';
     }
-
     function ytToShow(resp) {
         var ch = resp.channel || {};
         ytVideoMap = {};
@@ -2166,7 +2558,7 @@
             poster_url: ytProx(ch.avatar_url), has_poster: !!ch.avatar_url, genres: ch.tags || [], handle: ch.handle,
             subscriber_count: ch.subscriber_count, video_count: ch.video_count, view_count: ch.view_count,
             following: !!resp.following, _channel: ch, seasons: seasons, season_count: seasons.length,
-            episode_total: (ch.videos || []).length, episode_owned: 0 };
+            episode_total: (ch.videos || []).length, episode_owned: ytOwnedCount(ch.videos) };
     }
 
     // Stream the channel's FULL video catalog in batches via InnerTube (each page
@@ -2228,7 +2620,7 @@
         if (currentId !== id) artAttemptedFor = null;
         currentId = id;
         if (!root()) return;
-        ytFilter = { q: '', sort: 'newest' };   // a fresh channel starts unfiltered
+        ytFilter = { q: '', sort: 'newest', state: 'all', duration: 'all' };   // a fresh channel starts unfiltered
         ytCancelLoad();
         showLoading(true); resetExtras(); showEpSyncing(false);
         ['[data-vd-episodes]', '[data-vd-season-nav]'].forEach(function (s) { var n = q(s); if (n) n.innerHTML = ''; });
@@ -2266,14 +2658,14 @@
         // YouTube throttles large-playlist listing for our client — be honest when partial.
         var note = total > vids.length ? 'Showing ' + vids.length + ' of ' + total + ' videos.' : '';
         var season = { season_number: 1, title: 'Videos', poster_url: ytProx(pl.thumbnail_url),
-            episode_owned: 0, episode_total: vids.length, episodes: vids.map(ytEpisodeOf) };
+            episode_owned: ytOwnedCount(vids), episode_total: vids.length, episodes: vids.map(ytEpisodeOf) };
         return { kind: 'playlist', source: 'youtube', id: pl.playlist_id, title: pl.title || 'Playlist',
             overview: note, poster_url: ytProx(pl.thumbnail_url), has_poster: !!pl.thumbnail_url,
             backdrop_url: ytProx(pl.thumbnail_url), has_backdrop: !!pl.thumbnail_url,
             genres: pl.channel_title ? [pl.channel_title] : [], handle: null,
             subscriber_count: null, view_count: null, video_count: pl.video_count,
             following: !!resp.following, _playlist: pl, seasons: [season], season_count: 1,
-            episode_total: vids.length, episode_owned: 0 };
+            episode_total: vids.length, episode_owned: ytOwnedCount(vids) };
     }
 
     function loadPlaylist(id) {
@@ -2281,7 +2673,7 @@
         if (currentId !== id) artAttemptedFor = null;
         currentId = id;
         if (!root()) return;
-        ytFilter = { q: '', sort: 'newest' };
+        ytFilter = { q: '', sort: 'newest', state: 'all', duration: 'all' };
         ytCancelLoad();
         showLoading(true); resetExtras(); showEpSyncing(false);
         ['[data-vd-episodes]', '[data-vd-season-nav]'].forEach(function (s) { var n = q(s); if (n) n.innerHTML = ''; });
@@ -2341,6 +2733,7 @@
             // downloads do), and the buttons above were already patched in place —
             // re-rendering here just refetched every rail poster per click.
             var ep = ytFindEp(id); if (ep) ep.wished = val;
+            renderEssentials(data);
             document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed'));
         };
         if (on) yc.removeWish('video', id).then(function (d) { setOn(!(d && d.success)); }).catch(function () { btn.disabled = false; });
@@ -2554,13 +2947,24 @@
             e.preventDefault();
             document.dispatchEvent(new CustomEvent('soulsync:video-navigate', { detail: 'video-search' }));
             document.dispatchEvent(new CustomEvent('soulsync:video-search-query',
-                { detail: { q: kchip.getAttribute('data-vd-kw') } }));
+                { detail: { q: kchip.getAttribute('data-vd-kw'), source: 'keyword',
+                    kind: (data && data.kind === 'show') ? 'show' : 'movie' } }));
             return;
         }
         var shot = e.target.closest('[data-vd-shot]');
         if (shot && r.contains(shot)) { openLightbox(parseInt(shot.getAttribute('data-vd-shot'), 10) || 0); return; }
         var vid = e.target.closest('[data-vd-video]');
         if (vid && r.contains(vid)) { openTrailer(vid.getAttribute('data-vd-video')); return; }
+        var healthFix = e.target.closest('[data-vd-health-fix]');
+        if (healthFix && r.contains(healthFix)) {
+            e.preventDefault();
+            var hfId = data ? ((data.source !== 'tmdb') ? data.id : data.library_id) : null;
+            if (window.VideoManage && hfId != null) {
+                VideoManage.open({ kind: data.kind, id: hfId,
+                    focusMatch: healthFix.getAttribute('data-vd-health-fix') });
+            }
+            return;
+        }
         var castAll = e.target.closest('[data-vd-cast-all]');
         if (castAll && r.contains(castAll)) { openCastModal(); return; }
         var revMore = e.target.closest('[data-vd-review-more]');
@@ -2573,6 +2977,13 @@
         if (e.target.closest('[data-vd-ext]')) return;   // let watch links open
         var ytPlay = e.target.closest('[data-vd-yt-play]');   // play the video inline (reuses the trailer player)
         if (ytPlay && r.contains(ytPlay)) { e.preventDefault(); openTrailer(ytPlay.getAttribute('data-vd-yt-play')); return; }
+        var ytFacet = e.target.closest('[data-vd-yt-filter]');
+        if (ytFacet && r.contains(ytFacet) && data && data.source === 'youtube') {
+            e.preventDefault();
+            ytFilter[ytFacet.getAttribute('data-vd-yt-filter')] = ytFacet.getAttribute('data-vd-yt-filter-value') || 'all';
+            ytRegroup(true);
+            return;
+        }
         var ytWish = e.target.closest('[data-vd-yt-wish]');
         if (ytWish && r.contains(ytWish)) { e.preventDefault(); toggleYtWish(ytWish); return; }
         var ytPlW = e.target.closest('[data-vd-yt-pl-watch]');
@@ -2595,6 +3006,12 @@
             if (data && data.source === 'youtube') ytGrabSeasonInline(seasonGrab); else grabSeasonInline(seasonGrab);
             return;
         }
+        var seasonMon = e.target.closest('[data-vd-season-monitor]');
+        if (seasonMon && r.contains(seasonMon)) { e.preventDefault(); toggleSeasonMonitor(seasonMon); return; }
+        var seasonClr = e.target.closest('[data-vd-season-clearfail]');
+        if (seasonClr && r.contains(seasonClr)) { e.preventDefault(); clearSeasonFailures(seasonClr);
+            return;
+        }
         var seasonSearch = e.target.closest('[data-vd-season-search]');
         if (seasonSearch && r.contains(seasonSearch)) { e.preventDefault(); manualSearchSeason(); return; }
         var seasonWish = e.target.closest('[data-vd-season-wish]');
@@ -2614,6 +3031,9 @@
         var act = e.target.closest('[data-vd-act]');
         if (act && r.contains(act)) {
             var which = act.getAttribute('data-vd-act');
+            if (which === 'more') { toggleMoreMenu(act); return; }
+            // Any real action closes the menu it was picked from.
+            if (act.closest('[data-vd-more-menu]')) closeMoreMenu();
             if (which === 'watchlist') toggleWatchlist();
             else if (which === 'request') sendRequest(act);
             else if (which === 'wishtoggle') toggleMovieWishlist(act);
@@ -2623,12 +3043,22 @@
             else if (which === 'poster') openPosterModal();
             else if (which === 'manage') openManagePanel();
             else if (which === 'sync-show') syncShowNow(act);
+            else if (which === 'sync-movie') syncMovieNow(act);
             else if (which === 'watched-toggle') toggleWatchedState(act);
             else if (which === 'yt-follow') toggleYtFollow();
             else if (which === 'yt-pl-follow') toggleYtPlaylistFollowHero();
             else if (which === 'trailer' && data && data.trailer) openTrailer(data.trailer.key);
             return;
         }
+        var guestAll = e.target.closest('[data-vd-guests-all]');
+        if (guestAll && r.contains(guestAll)) {
+            e.preventDefault();
+            var gwrap = guestAll.closest('.vd-ep-guests');
+            if (gwrap) gwrap.classList.add('vd-ep-guests--all');
+            guestAll.remove();
+            return;
+        }
+        if (!e.target.closest('[data-vd-more]')) closeMoreMenu();   // click-away
         var mt = e.target.closest('[data-vd-missing-toggle]');
         if (mt && r.contains(mt)) { toggleMissing(); return; }
         if (menuOpen && !e.target.closest('[data-vd-season-nav]')) { menuOpen = false; renderSeasonNav(); }
@@ -2811,6 +3241,54 @@
                 } else { toast((d && d.error) || 'Could not add to wishlist', 'error'); }
             })
             .catch(function () { btn.disabled = false; _btnLabel(btn, 'Wishlist year'); toast('Could not add to wishlist', 'error'); });
+    }
+
+    // Season monitoring is per-episode in the schema, so the toggle flips every
+    // episode of the season and the local copy follows without a page reload.
+    function toggleSeasonMonitor(btn) {
+        var season = seasonByNum(selectedSeason);
+        if (!data || data.kind !== 'show' || !season) return;
+        var libId = (data.source !== 'tmdb') ? data.id : data.library_id;
+        if (libId == null) return;
+        var want = btn.getAttribute('data-vd-season-monitor') === '1';
+        btn.disabled = true;
+        fetch('/api/video/detail/show/' + libId + '/season/' + season.season_number + '/monitor', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ monitored: want }),
+        }).then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (res) {
+              btn.disabled = false;
+              if (!res || !res.success) { toast('Couldn\u2019t change monitoring', 'error'); return; }
+              season.episode_monitored = want ? season.episodes.length : 0;
+              season.episodes.forEach(function (e) { e.monitored = want; });
+              renderEpisodes();
+              toast(want ? 'Season monitored' : 'Season unmonitored', 'success');
+          }).catch(function () { btn.disabled = false; toast('Couldn\u2019t change monitoring', 'error'); });
+    }
+
+    // Stalled rows back off for hours by design; this is the user saying "no,
+    // try now, and try everything". The endpoint clears the backoff evidence
+    // and re-searches every source for the season in one call.
+    function clearSeasonFailures(btn) {
+        var season = seasonByNum(selectedSeason);
+        if (!data || !data.tmdb_id || !season) return;
+        btn.disabled = true; _btnLabel(btn, 'Retrying\u2026');
+        var done = function (msg, type) {
+            btn.disabled = false; _btnLabel(btn, 'Clear failures');
+            toast(msg, type);
+        };
+        fetch('/api/video/wishlist/retry', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: 'season', tmdb_id: data.tmdb_id,
+                                   season_number: season.season_number }),
+        }).then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (res) {
+              if (!res || !res.success) { done('Retry failed to start', 'error'); return; }
+              var n = Number(res.reset) || 0;
+              done(n ? 'Cleared ' + n + ' stalled row' + (n === 1 ? '' : 's') + ', searching again'
+                     : 'Nothing stalled in this season', n ? 'success' : 'info');
+              document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed'));
+          }).catch(function () { done('Retry failed to start', 'error'); });
     }
 
     function grabSeasonInline(btn) {
@@ -3069,7 +3547,7 @@
             var poster = q('[data-vd-poster]');
             if (poster) { poster.onload = function () { applyAccent(poster); }; poster.src = '/api/video/poster/' + data.kind + '/' + libId + '?' + cb; }
             var bg = q('[data-vd-backdrop]');
-            if (bg && !data.has_backdrop) bg.style.backgroundImage = "url('/api/video/poster/" + data.kind + '/' + libId + '?' + cb + "')";
+            if (bg && !data.has_backdrop) bg.style.backgroundImage = "url('" + (window.SoulSyncURL?.resolve('/api/video/poster/') || '/api/video/poster/') + data.kind + '/' + libId + '?' + cb + "')";
         });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Escape') { closeTrailer(); closeLightbox(); closeCastModal(); }

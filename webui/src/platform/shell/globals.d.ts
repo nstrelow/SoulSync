@@ -120,14 +120,30 @@ declare global {
      *  Must be given the id explicitly once React owns the page. */
     playArtistRadio?: (artistId?: string | number, artistName?: string) => void;
     /** stats-automations.js — the parameterized radio core the Artist Web's
-     *  "Play radio" hands off to (survives the discover.js deletion). */
-    startArtistRadioById?: (artistId: string | number, artistName: string) => void | Promise<void>;
+     *  "Play radio" and the discover Stations row hand off to (survives the
+     *  discover.js deletion).
+     *
+     *  RESOLVES false when nothing could be played. It used to resolve
+     *  undefined either way, so a caller reported success for a station that
+     *  never started. */
+    startArtistRadioById?: (
+      artistId: string | number,
+      artistName: string,
+    ) => Promise<boolean | void> | boolean | void;
     /** media-player.js — seedless Library Radio: queues a ranked-random batch
      *  from the whole library and arms radio mode for refills. */
     startLibraryRadio?: () => void | Promise<void>;
     /** media-player.js — play a resolved library track list (radio-row shape)
      *  as the queue, labeled with a "Playing from" context. */
-    playTrackList?: (tracks: unknown[], contextName?: string) => void | Promise<void>;
+    cancelPendingPlayback?: () => void;
+    playTrackList?: (
+      tracks: unknown[],
+      contextName?: string,
+      options?: { isCurrent: () => boolean },
+    ) =>
+      | void
+      | { status: string; error?: string }
+      | Promise<void | { status: string; error?: string }>;
     /** sync-services.js — the WHOLE ListenBrainz playlist sync: fetch, virtual
      *  playlist, status polling into the discover-lb-playlist-<id>-sync-*
      *  spans. Shared (survives discover.js's deletion), so the React page
@@ -292,6 +308,9 @@ declare global {
       spotifyTracks: unknown[],
       artist?: unknown,
       album?: unknown,
+      /** Explicit "who made this playlist". Without it the modal sniffs the id
+       *  prefix and DEFAULTS to YouTube, which mislabels a SoulSync station. */
+      sourceLabel?: string | null,
     ) => void | Promise<void>;
     /** init.js:1465 — the My Accounts / personal settings modal. */
     openPersonalSettings?: () => void | Promise<void>;
@@ -453,6 +472,14 @@ declare global {
     startAudioPlayback?: () => void | Promise<void>;
     /** media-player.js — starts streaming a search result in the player. */
     startStream?: (searchResult: unknown) => void | Promise<void>;
+    /** media-player.js — plays a track directly from a search/preview context. */
+    playTrackDirectly?: (info: {
+      name: string;
+      artist: string;
+      album?: string;
+      image_url?: string;
+      source?: string;
+    }) => void;
     /** Repaints the search download bubbles from the vanilla bubble store into
      *  #enhanced-main-results-area (shared-helpers.js). The React search page
      *  calls it on mount because it recreates that container each visit. */
@@ -548,6 +575,83 @@ declare global {
     discoverMirroredPlaylist?: (playlistId: number) => void | Promise<void>;
     openWatchlistHistoryModal?: () => void;
     openBlocklistModal?: (initialType: string) => void;
+    /** the rest of the blocklist modal surface - lives in src/shell since the
+     * aug 26 TS port; inline onclick handlers in its generated HTML use these. */
+    closeBlocklistModal?: () => void;
+    switchBlocklistTab?: (type: string) => void;
+    onBlocklistSearchInput?: () => void;
+    blockFromSearch?: (payloadEnc: string) => Promise<void>;
+    unblockEntry?: (id: number) => Promise<void>;
+    /** shared-helpers.js html escaper (also re-declared by downloads.js) */
+    escapeHtml?: (text: unknown) => string;
+    /** init.js - the active profile, or null before profiles load */
+    getCurrentProfileContext?: () => ShellProfileContext | null;
+    /** shared-helpers.js - refresh the sidebar service dots */
+    fetchAndUpdateServiceStatus?: () => void;
+    /** src/shell ports (aug 26): origin-history, watchlist-history (already
+     * declared piecemeal below where react used them), my-accounts,
+     * service-switch - inline onclick handlers in their generated markup */
+    closeDownloadOriginsModal?: () => void;
+    switchDownloadOriginTab?: (tab: string) => void;
+    toggleOriginGroup?: (btn: HTMLElement) => void;
+    toggleOriginEntry?: (id: number, on: boolean) => void;
+    toggleAllOriginEntries?: (on: boolean) => void;
+    deleteSelectedOriginEntries?: (singleId?: number) => Promise<void>;
+    openMyAccountsModal?: () => void;
+    closeMyAccountsModal?: () => void;
+    connectMyAccount?: (serviceId: string) => void;
+    saveMyAccountToken?: (serviceId: string) => Promise<void>;
+    disconnectMyAccount?: (serviceId: string) => Promise<void>;
+    openServiceSwitchModal?: (tab?: string) => void;
+    closeServiceSwitchModal?: () => void;
+    switchServiceSwitchTab?: (tab: string) => void;
+    setActiveSource?: (kind: string, id: string) => Promise<void>;
+    setDownloadMode?: (which: string) => Promise<void>;
+    closeWatchlistHistoryModal?: () => void;
+    toggleWatchlistHistoryRun?: (runId: string, btn: HTMLElement) => Promise<void>;
+    /** src/shell ports (aug 26, batch 3): library-globals, track-detail,
+     * manual-library-match, server-activity */
+    artistDetailBackLabels?: Record<string, string>;
+    artistDetailLabelStack?: Array<
+      { type: 'page'; pageId: string } | { type: 'artist'; name: string }
+    >;
+    navigateToArtistDetail?: (
+      artistId: string | number,
+      artistName: string,
+      sourceOverride?: string | null,
+      options?: { skipRouteChange?: boolean },
+    ) => void;
+    playLibraryTrack?: (
+      track: Record<string, unknown>,
+      albumTitle?: string,
+      artistName?: string,
+    ) => Promise<void>;
+    clearArtistDetailPageState?: () => void;
+    openTrackDetail?: (taskId: string) => Promise<void>;
+    closeTrackDetail?: () => void;
+    _mlmClose?: () => void;
+    _mlmSourceDebounce?: (q: string) => void;
+    _mlmLibraryDebounce?: (q: string) => void;
+    _mlmSelectSource?: (idx: number) => void;
+    _mlmSelectLibrary?: (idx: number) => void;
+    _mlmSaveMatch?: () => Promise<void>;
+    _mlmDeleteMatch?: (id: number) => Promise<void>;
+    ServerActivity?: {
+      toggle: () => void;
+      open: () => void;
+      close: () => void;
+      refresh: () => Promise<unknown>;
+      _onSocket: (d: unknown) => void;
+      _wantsLive: () => boolean;
+    };
+    SoulSyncActivitySocket?: {
+      isConnected: () => boolean;
+      subscribe: () => void;
+      unsubscribe: () => void;
+    };
+    SoulSyncVideo?: {
+      openDetail?: (args: { kind: string; id: number | string; source?: string }) => void;
+    };
     SoulSyncIssueDomain?: IssueDomainBridge;
     SoulSyncWorkflowActions?: {
       openDownloadMissingAlbum: (input: DownloadMissingAlbumWorkflowInput) => void | Promise<void>;
@@ -625,6 +729,8 @@ declare global {
           artist_id?: string | number | null;
           album_id?: string | number | null;
           _stats_image?: string | null;
+          /** Play this exact file: skip the title+artist re-resolve. */
+          exact_path?: boolean;
         },
         albumTitle: string,
         artistName: string,
@@ -752,6 +858,9 @@ declare global {
     disablePlaylistSelection?: (disabled: boolean) => void;
     updateRefreshButtonState?: () => void;
     getSyncAccountPlaylists?: () => { id: string | number; name?: string }[];
+    /** Ask the tools page to show whichever tab holds `selector`. True when it
+     *  had to switch, so the caller knows to wait a frame before measuring. */
+    revealToolsTabFor?: (selector: string) => boolean;
   }
 }
 

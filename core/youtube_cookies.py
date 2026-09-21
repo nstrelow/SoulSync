@@ -27,6 +27,25 @@ from typing import Any, Dict, Optional
 # browser name. Anything else non-empty is treated as a browser for cookiesfrombrowser.
 PASTE_MODE = "custom"
 
+# Netscape cookies.txt convention: an HttpOnly cookie's domain field is prefixed
+# with this marker instead of being left plain. These are exactly the
+# session-identity cookies (SID, __Secure-1PSID, HSID, SSID, the SIDTS tokens)
+# that actually authenticate a request — treating the whole line as a comment
+# silently drops the cookies needed to look signed in.
+_HTTPONLY_PREFIX = "#HttpOnly_"
+
+
+def _cookie_line_fields(raw: str) -> Optional[list]:
+    """Split one cookies.txt line into its tab-separated fields, or ``None``
+    for a blank line or a genuine comment. Strips ``_HTTPONLY_PREFIX`` first."""
+    line = raw.rstrip("\n")
+    stripped = line.lstrip()
+    if stripped.startswith(_HTTPONLY_PREFIX):
+        line = stripped[len(_HTTPONLY_PREFIX):]
+    elif not line or stripped.startswith("#"):
+        return None
+    return line.split("\t")
+
 # ytmusicapi speaks to the same YouTube backend but wants HEADERS, not a cookie
 # file, so the pasted cookies.txt has to be projected into them (below).
 
@@ -37,15 +56,58 @@ _SAPISID_NAMES = ("__Secure-3PAPISID", "__Secure-1PAPISID", "SAPISID")
 # A browser export can carry 90 KB+ of cookies across every Google property,
 # and YouTube rejects a request whose headers are that large (HTTP 413). Only
 # these actually matter for auth.
+#
+# __Secure-1PSIDTS / __Secure-3PSIDTS are rotating session-refresh tokens
+# Google now binds the SID/SAPISID family to.
 _ESSENTIAL_COOKIES = frozenset({
     "APISID", "HSID", "SSID", "SID", "SAPISID",
     "__Secure-1PAPISID", "__Secure-3PAPISID",
     "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
     "LOGIN_INFO", "PREF", "SOCS", "VISITOR_INFO1_LIVE", "YSC",
 })
 
 # Must match the Origin header ytmusicapi sends, or the hash is rejected.
 _YTMUSIC_ORIGIN = "https://music.youtube.com"
+
+
+def cookie_setup_problem(
+    mode: Any,
+    cookiefile_path: str = "",
+    *,
+    cookiefile_exists: bool = False,
+) -> Optional[str]:
+    """Why the configured cookies will NOT be used, or ``None`` when they will.
+
+    ``build_youtube_cookie_opts`` returns ``{}`` for paste mode with a missing
+    file, which is the right call — a broken ``cookiefile`` arg is worse than
+    none. What was missing is anybody saying so. The dropdown still reads
+    "Paste cookies.txt", so Settings looks configured while every request goes
+    out signed-out, and the user is left arguing with a bot gate about cookies
+    they believe are in play.
+
+    Docker makes this the default outcome rather than an edge case: the path
+    lives in the database (a mounted volume) and the file lives in the config
+    folder (often NOT one), so an image pull takes the file and leaves the
+    setting. "It worked for a couple of days and then stopped, and I changed
+    nothing" is what that looks like from the outside.
+
+    Pure — the caller does the ``os.path.exists``, same as the builder.
+    """
+    if str(mode or "").strip() != PASTE_MODE:
+        return None
+    if not cookiefile_path:
+        return ("Settings has 'Paste cookies.txt' selected but no file was ever "
+                "saved, so YouTube requests are going out signed-out. Paste your "
+                "cookies.txt again in Settings -> YouTube.")
+    if not cookiefile_exists:
+        return (f"Settings has 'Paste cookies.txt' selected but the saved file is "
+                f"gone ({cookiefile_path}), so YouTube requests are going out "
+                f"signed-out. Paste your cookies.txt again in Settings -> YouTube. "
+                f"In Docker this happens when the config folder is not a mounted "
+                f"volume: the file dies with the container while the setting "
+                f"survives in the database.")
+    return None
 
 
 def build_youtube_cookie_opts(
@@ -88,10 +150,8 @@ def looks_like_cookiefile(content: Any) -> bool:
     if not content or not isinstance(content, str):
         return False
     for raw in content.splitlines():
-        line = raw.rstrip("\n")
-        if not line or line.lstrip().startswith("#"):
-            continue
-        if len(line.split("\t")) >= 6:
+        fields = _cookie_line_fields(raw)
+        if fields is not None and len(fields) >= 6:
             return True
     return False
 
@@ -134,11 +194,8 @@ def parse_netscape_cookies(content: Any) -> Dict[str, str]:
     if not content or not isinstance(content, str):
         return cookies
     for raw in content.splitlines():
-        line = raw.rstrip("\n")
-        if not line or line.lstrip().startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 7:
+        fields = _cookie_line_fields(raw)
+        if fields is None or len(fields) < 7:
             continue
         name, value = fields[5].strip(), fields[6].strip()
         if name:

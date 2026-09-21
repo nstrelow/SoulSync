@@ -258,6 +258,11 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
         except Exception:  # noqa: BLE001 - ranking still works without chain order
             source_order = None
 
+    from core.downloads.size_limit import filter_music_candidates
+    expected_duration_ms = (track.get('duration_ms') if isinstance(track, dict)
+                            else getattr(track, 'duration_ms', None))
+    candidates = filter_music_candidates(candidates, expected_duration_ms=expected_duration_ms)
+
     candidates = order_candidates(
         candidates, quality_first=quality_first, targets=quality_targets,
         source_order=source_order,
@@ -428,7 +433,17 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
 
             # Initiate download
             logger.info(f"[Modal Worker] Starting download: {username} / {os.path.basename(filename)}")
-            download_id = deps.run_async(deps.download_orchestrator.download(username, filename, size))
+            _download_kwargs = {}
+            if track_info.get('quality_profile_id') is not None:
+                _download_kwargs['quality_profile_id'] = track_info['quality_profile_id']
+            download_id = deps.run_async(
+                deps.download_orchestrator.download(
+                    username,
+                    filename,
+                    size,
+                    **_download_kwargs,
+                )
+            )
 
             if download_id:
                 # Store context for post-processing with complete Spotify metadata (GUI PARITY)

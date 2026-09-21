@@ -107,6 +107,95 @@ def _basic_indexer_names(body) -> list:
     return aliases.get(key, [])
 
 
+def _format_strategy_query(search_type: str, query: str, extra: list) -> str:
+    params = " ".join("%s=%s" % (k, v) for k, v in (extra or []) if v is not None)
+    return ("%s: %s %s" % (search_type, query, params)).strip()
+
+
+def _search_queries(body, source: str, scope: str, title: str, season, episode) -> list:
+    """Human-readable queries this manual search request will run/start."""
+    body = body if isinstance(body, dict) else {}
+    source = str(source or "").lower()
+    if source in ("torrent", "usenet"):
+        try:
+            from core.video.prowlarr_search import build_strategies
+            return [_format_strategy_query(t, q, extra) for t, q, extra in build_strategies(
+                scope, title, year=body.get("year"), season=season, episode=episode,
+                air_date=body.get("air_date"), absolute=body.get("absolute"),
+                series_type=body.get("series_type"), **_external_ids(body))]
+        except Exception:   # noqa: BLE001 - query visibility must never break search
+            logger.debug("manual search query summary failed", exc_info=True)
+    if source == "extto":
+        return [str(title or "").strip()] if str(title or "").strip() else []
+    try:
+        from core.video.slskd_search import build_query
+        q = build_query(scope, title, year=body.get("year"), season=season, episode=episode,
+                        air_date=body.get("air_date"), absolute=body.get("absolute"),
+                        series_type=body.get("series_type"))
+        return [q] if q else []
+    except Exception:   # noqa: BLE001
+        logger.debug("manual search text query summary failed", exc_info=True)
+        return []
+
+
+def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
+    """The torrent/usenet lane, in ONE place.
+
+    Returns ``(hits, note, hard_error)``. ``hard_error`` is set only when NOTHING
+    could run; ``note`` reports a half that failed while the other answered.
+
+    This exists because there are two manual-search endpoints - /downloads/search
+    and /downloads/search/start - and only the second is reachable from any UI.
+    They each had their own copy of "search the torrent lane", so adding EXT.to
+    to one of them shipped a feature nobody could see. One function now, called
+    by both, and they cannot drift again.
+
+    EXT.to is the OTHER HALF of the torrent lane, the same way the wishlist drain
+    treats it (video_process_wishlist._hits_for_context). Usenet stays
+    Prowlarr-only: EXT.to is torrents.
+    """
+    from core.video.prowlarr_search import prowlarr_search
+    # A person is waiting on this response, so bound the time it will sit in the
+    # shared Prowlarr budget (core.prowlarr_throttle). The background wishlist
+    # drain queues happily; a manual search should say "busy, try again" rather
+    # than hold a request worker while the drain empties the window.
+    pres = prowlarr_search(scope, title, year=body.get("year"),
+                           season=want_season, episode=want_episode, source=source,
+                           max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
+                           indexer_names=_basic_indexer_names(body),
+                           **_external_ids(body))
+    prowlarr_error = None
+    if not pres.get("configured"):
+        prowlarr_error = ("Prowlarr isn't configured — set its URL + key on "
+                          "Settings → Downloads.")
+    elif pres.get("error"):
+        prowlarr_error = "Prowlarr: " + str(pres["error"])
+    hits = list(pres.get("hits") or [])
+
+    extto_note = None
+    if source == "torrent":
+        from core.video.extto_search import extto_search
+        try:
+            eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
+                                resolve_magnets=False, max_candidates=1)
+        except Exception as exc:   # noqa: BLE001 - one half must not sink the lane
+            eres = {"configured": True, "error": str(exc), "hits": []}
+        if not eres.get("configured"):
+            extto_note = "EXT.to needs FlareSolverr — set flaresolverr.url."
+        elif eres.get("error"):
+            extto_note = "EXT.to: " + str(eres["error"])
+        else:
+            hits = hits + list(eres.get("hits") or [])
+
+    # The lane has only genuinely FAILED when neither half could run. Returning
+    # Prowlarr's error while EXT.to had results would hide them behind a message
+    # about a service the user may not even run.
+    if prowlarr_error and not hits:
+        return [], None, (prowlarr_error + (" · " + extto_note if extto_note else ""))
+    note = " · ".join(n for n in (prowlarr_error, extto_note) if n) or None
+    return hits, note, None
+
+
 def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None, want_year=None,
                    want_title=None, blocked_users=None, want_date=None, want_absolute=None) -> list:
     """Parse → evaluate → rank a list of raw indexer hits against the quality profile.
@@ -290,6 +379,8 @@ def register_routes(bp):
         if not out["movies_path"]:        # migrate the legacy single transfer folder → Movies
             out["movies_path"] = db.get_setting("transfer_path") or ""
         out["download_path"] = config_manager.get(_SHARED_DOWNLOAD_KEY, "") or ""   # shared w/ music
+        from core.video.library_roots import ADDITIONAL_KEYS, additional_paths
+        out.update({key: additional_paths(db, key) for key in ADDITIONAL_KEYS})
         out.update(load_source(db))   # download_mode + hybrid_order
         return jsonify(out)
 
@@ -299,6 +390,14 @@ def register_routes(bp):
         from core.video.download_config import save as save_source
         db = get_video_db()
         body = request.get_json(silent=True) or {}
+        from core.video.library_roots import ADDITIONAL_KEYS, normalize_paths
+        import json
+        try:
+            extras = {key: normalize_paths(body[key]) for key in ADDITIONAL_KEYS if key in body}
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        for key, paths in extras.items():
+            db.set_setting(key, json.dumps(paths))
         for key in _PATH_KEYS:
             if key in body:
                 db.set_setting(key, (str(body.get(key) or "")).strip())
@@ -381,6 +480,67 @@ def register_routes(bp):
         if res.get("status") == "skipped":
             return jsonify({"success": False, "error": "A rename run is already in progress."}), 409
         return jsonify({"success": True, **res})
+
+    # ── the recycle bin, browsable (Aug 27 — parity with the music side's
+    #    deleted-files manager: list / restore / purge / bulk) ──
+    @bp.route("/downloads/recycle", methods=["GET"])
+    def video_downloads_recycle():
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
+
+        from . import get_video_db
+        db = get_video_db()
+        settings = _org_load(db)
+        items = _recycle.list_entries(settings, db)
+        return jsonify({
+            "success": True,
+            "items": items,
+            "total_size": sum(i.get("size") or 0 for i in items),
+            "keep_days": int(settings.get("recycle_keep_days") or 7),
+            "recycle_enabled": bool(settings.get("recycle_deletes", True)),
+        })
+
+    @bp.route("/downloads/recycle/restore", methods=["POST"])
+    def video_downloads_recycle_restore():
+        """Body: {trash_dir, name} for one entry, or {all: true}."""
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
+
+        from . import get_video_db
+        db = get_video_db()
+        settings = _org_load(db)
+        body = request.get_json(silent=True) or {}
+        if body.get("all"):
+            restored = 0
+            failed = 0
+            for entry in _recycle.list_entries(settings, db):
+                res = _recycle.restore_entry(entry["trash_dir"], entry["name"], settings, db)
+                if res.get("success"):
+                    restored += 1
+                else:
+                    failed += 1
+            return jsonify({"success": failed == 0, "restored": restored, "failed": failed})
+        res = _recycle.restore_entry(body.get("trash_dir"), body.get("name"), settings, db)
+        return jsonify(res), (200 if res.get("success") else 400)
+
+    @bp.route("/downloads/recycle/purge", methods=["POST"])
+    def video_downloads_recycle_purge():
+        """Body: {trash_dir, name} for one entry, or {all: true} to empty."""
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
+
+        from . import get_video_db
+        db = get_video_db()
+        settings = _org_load(db)
+        body = request.get_json(silent=True) or {}
+        if body.get("all"):
+            purged = 0
+            for entry in _recycle.list_entries(settings, db):
+                if _recycle.purge_entry(entry["trash_dir"], entry["name"], settings, db).get("success"):
+                    purged += 1
+            return jsonify({"success": True, "purged": purged})
+        res = _recycle.purge_entry(body.get("trash_dir"), body.get("name"), settings, db)
+        return jsonify(res), (200 if res.get("success") else 400)
 
     @bp.route("/downloads/blocklist", methods=["GET"])
     def video_downloads_blocklist():
@@ -801,47 +961,45 @@ def register_routes(bp):
         want_season, want_episode, season_end = _search_ints(body)
         profile, _pid = _profile_for_request(get_video_db(), body)
         live = False
+        partial_note = None
+        queries = _search_queries(body, source, scope, title, want_season, want_episode)
         if source == "soulseek":
             from core.video.slskd_search import build_query, slskd_search
             sres = slskd_search(build_query(scope, title, year=body.get("year"),
                                             season=want_season, episode=want_episode))
             if not sres.get("configured"):
-                return jsonify({"scope": scope, "results": [], "error": "slskd isn't configured — set its URL on Settings → Downloads."})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if sres.get("error"):
-                return jsonify({"scope": scope, "results": [], "error": "slskd: " + str(sres["error"])})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "slskd: " + str(sres["error"])})
             raw, live = sres["hits"], True
         elif source == "extto":
             from core.video.extto_search import extto_search
             eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
                                  resolve_magnets=False, max_candidates=1)
             if not eres.get("configured"):
-                return jsonify({"scope": scope, "results": [], "error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
             if eres.get("error"):
-                return jsonify({"scope": scope, "results": [], "error": "EXT.to: " + str(eres["error"])})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "EXT.to: " + str(eres["error"])})
             raw, live = eres["hits"], True
         elif source in ("torrent", "usenet"):
-            from core.video.prowlarr_search import prowlarr_search
-            # A person is waiting on this response, so bound the time it will
-            # sit in the shared Prowlarr budget (core.prowlarr_throttle). The
-            # background wishlist drain queues happily; a manual search should
-            # say "busy, try again" rather than hold a request worker while the
-            # drain empties the window.
-            pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source,
-                                   max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
-                                   indexer_names=_basic_indexer_names(body),
-                                   **_external_ids(body))
-            if not pres.get("configured"):
-                return jsonify({"scope": scope, "results": [],
-                                "error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
-            if pres.get("error"):
-                return jsonify({"scope": scope, "results": [], "error": "Prowlarr: " + str(pres["error"])})
-            raw, live = pres["hits"], True
+            raw, partial_note, hard_error = _torrent_lane_hits(
+                body, scope, title, want_season, want_episode, source)
+            if hard_error:
+                return jsonify({"scope": scope, "results": [], "queries": queries,
+                                "error": hard_error})
+            live = True
         else:
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
-        return jsonify({"scope": scope, "live": live,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
+        payload = {"scope": scope, "live": live, "queries": queries,
+                   "results": _evaluate_hits(raw, profile, scope, want_season, want_episode,
+                                             want_year=body.get("year"),
+                                             want_title=body.get("title"))}
+        # One half of the lane was down but the other answered: show the results
+        # AND say what is missing, rather than silently returning a short list.
+        if partial_note:
+            payload["note"] = partial_note
+        return jsonify(payload)
 
     @bp.route("/downloads/search/start", methods=["POST"])
     def video_downloads_search_start():
@@ -855,6 +1013,7 @@ def register_routes(bp):
         title = body.get("title") or ""
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
+        queries = _search_queries(body, source, scope, title, want_season, want_episode)
 
         if source == "soulseek":
             from core.video.slskd_search import (
@@ -863,11 +1022,11 @@ def register_routes(bp):
                                            season=want_season, episode=want_episode),
                                max_throttle_wait=_INTERACTIVE_MAX_WAIT_SECONDS)
             if not res.get("configured"):
-                return jsonify({"error": "slskd isn't configured — set its URL on Settings → Downloads."})
+                return jsonify({"queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if res.get("error"):
-                return jsonify({"error": "slskd: " + str(res["error"])})
+                return jsonify({"queries": queries, "error": "slskd: " + str(res["error"])})
             # how long the client should keep polling (slskd keeps searching this long).
-            return jsonify({"id": res["id"], "live": True, "complete": False,
+            return jsonify({"id": res["id"], "live": True, "complete": False, "queries": queries,
                             "poll_ms": search_timeout_ms() + 8000})
         profile, _pid = _profile_for_request(get_video_db(), body)
         if source == "extto":
@@ -875,35 +1034,31 @@ def register_routes(bp):
             eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
                                  resolve_magnets=False, max_candidates=1)
             if not eres.get("configured"):
-                return jsonify({"error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
+                return jsonify({"queries": queries, "error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
             if eres.get("error"):
-                return jsonify({"error": "EXT.to: " + str(eres["error"])})
-            return jsonify({"id": None, "live": True, "complete": True,
+                return jsonify({"queries": queries, "error": "EXT.to: " + str(eres["error"])})
+            return jsonify({"id": None, "live": True, "complete": True, "queries": queries,
                             "results": _evaluate_hits(eres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
         if source in ("torrent", "usenet"):
             # Prowlarr is synchronous — like the old mock, results come back in one shot
-            # (no polling id), so the client renders immediately.
-            from core.video.prowlarr_search import prowlarr_search
-            # A person is waiting on this response, so bound the time it will
-            # sit in the shared Prowlarr budget (core.prowlarr_throttle). The
-            # background wishlist drain queues happily; a manual search should
-            # say "busy, try again" rather than hold a request worker while the
-            # drain empties the window.
-            pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source,
-                                   max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
-                                   indexer_names=_basic_indexer_names(body),
-                                   **_external_ids(body))
-            if not pres.get("configured"):
-                return jsonify({"error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
-            if pres.get("error"):
-                return jsonify({"error": "Prowlarr: " + str(pres["error"])})
-            return jsonify({"id": None, "live": True, "complete": True,
-                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
+            # (no polling id), so the client renders immediately. Shares the lane
+            # with /downloads/search so EXT.to cannot be wired into one and not
+            # the other; this is the endpoint every UI actually calls.
+            hits, note, hard_error = _torrent_lane_hits(
+                body, scope, title, want_season, want_episode, source)
+            if hard_error:
+                return jsonify({"queries": queries, "error": hard_error})
+            out = {"id": None, "live": True, "complete": True, "queries": queries,
+                   "results": _evaluate_hits(hits, profile, scope, want_season, want_episode,
+                                             want_year=body.get("year"),
+                                             want_title=body.get("title"))}
+            if note:
+                out["note"] = note
+            return jsonify(out)
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
-        return jsonify({"id": None, "live": False, "complete": True,
+        return jsonify({"id": None, "live": False, "complete": True, "queries": queries,
                         "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
 
     @bp.route("/downloads/search/poll", methods=["GET"])
@@ -944,6 +1099,28 @@ def register_routes(bp):
         # the importer deletes the file out from under the seeding torrent, and the
         # seeding sweep's source='torrent' query never sees the row. EXT.to keeps its
         # identity in username/indexer_id, same as thepiratebay and 1337x already do.
+        # Room FIRST, before anything expensive. Resolving an EXT.to magnet is a
+        # Cloudflare challenge that can run half a minute, and a grab that the
+        # disk guard was always going to refuse should not pay for it: Boulder's
+        # 507 took 39.9 seconds to arrive, all of it spent earning a magnet that
+        # was then thrown away.
+        db = get_video_db()
+        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
+        if not paths["movies_path"]:
+            paths["movies_path"] = db.get_setting("transfer_path") or ""
+        target = target_dir_for(body.get("kind"), paths)
+        from core.video import disk_guard, organization
+        room = disk_guard.check_room(
+            target, organization.load(db),
+            # the scratch volume only has to fit THIS release, not the library's
+            # headroom preference
+            needed_gb=(int(body.get("size_bytes") or 0) / (1024 ** 3)) or None)
+        if not room["ok"]:
+            return jsonify({"ok": False,
+                            "error": disk_guard.shortfall_message(room, target)}), 507
+        if not target:
+            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
+
         if source == "extto":
             source = "torrent"
             body["username"] = body.get("username") or "EXT.to"
@@ -966,18 +1143,6 @@ def register_routes(bp):
         if source in ("torrent", "usenet") and not body.get("download_url"):
             return jsonify({"ok": False, "error": "Missing the release's download URL."}), 400
 
-        db = get_video_db()
-        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
-        if not paths["movies_path"]:
-            paths["movies_path"] = db.get_setting("transfer_path") or ""
-        target = target_dir_for(body.get("kind"), paths)
-        from core.video import disk_guard, organization
-        ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
-        if not ok_room:
-            return jsonify({"ok": False, "error": "Drive is nearly full (%.1f GB free) — "
-                            "below your minimum free space setting." % (free or 0)}), 507
-        if not target:
-            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
 
         # In-flight dedup — if this exact episode is already downloading/queued, don't
         # start a duplicate (e.g. grabbing an episode that a pack grab already queued).
@@ -990,6 +1155,7 @@ def register_routes(bp):
         import json as _json
         from core.video.slskd_search import build_query
         ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
         _prof, _pid = _profile_for_request(db, body)
         common = {
             "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
@@ -1069,10 +1235,10 @@ def register_routes(bp):
         paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
         target = target_dir_for("show", paths)
         from core.video import disk_guard, organization
-        ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
-        if not ok_room:
-            return jsonify({"ok": False, "error": "Drive is nearly full (%.1f GB free) — "
-                            "below your minimum free space setting." % (free or 0)}), 507
+        room = disk_guard.check_room(target, organization.load(get_video_db()))
+        if not room["ok"]:
+            return jsonify({"ok": False,
+                            "error": disk_guard.shortfall_message(room, target)}), 507
         if not target:
             return jsonify({"ok": False, "error": "Set the TV library folder on Settings → Downloads."}), 400
 
@@ -1102,7 +1268,8 @@ def register_routes(bp):
             if not res.get("ok"):
                 skipped += 1
                 continue
-            ctx = {"scope": "episode", "title": title, "season": sn, "episode": en, "year": body.get("year")}
+            ctx = {"scope": "episode", "title": title, "season": sn, "episode": en, "year": body.get("year"),
+                   "user_initiated": True, "import_policy": "user_replace"}
             first_query = build_query("episode", title, season=sn, episode=en)
             dl_id = db.add_video_download({
                 "kind": "show", "title": title, "release_title": _os.path.basename(str(fn)),

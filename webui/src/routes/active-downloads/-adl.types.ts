@@ -318,7 +318,7 @@ export interface AdlDeletedEntry {
   size: number;
   /** null for files quarantined before the manifest existed. */
   deleted_at: string | null;
-  /** 'repair' | 'duplicate-cleaner' | null when unknown. */
+  /** 'repair' | 'duplicate-cleaner' | 'album_bundle_orphan' | null when unknown. */
   source: string | null;
   original_path: string;
 }
@@ -339,8 +339,8 @@ export interface AdlDeletedList {
  * every cancelled row out of the Failed pill.
  */
 export const ADL_FILTER_STATUSES: Record<string, readonly string[]> = {
-  active: ['downloading', 'searching', 'post_processing'],
-  queued: ['queued'],
+  active: ['downloading', 'searching', 'post_processing', 'importing', 'staged'],
+  queued: ['queued', 'unavailable'],
   completed: ['completed', 'skipped', 'already_owned'],
   failed: ['failed', 'not_found', 'cancelled'],
 };

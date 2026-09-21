@@ -137,13 +137,18 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         track_results: List[TrackResult] = []
         album_map: Dict[str, AlbumResult] = {}
         album_order: List[str] = []
-        preferred = self._client.preferred_codec
+        preferred = quality_tier_for_source(
+            'amazon', default=self._quality,
+        )
         # Search results only carry the codec (real sample_rate arrives at
         # stream time). Claim the format honestly — FLAC for the lossless
         # codec, lossy otherwise — so audio_quality derives a real format
         # instead of the display label ("Lossless"), and the post-download
         # probe pins the actual sample_rate/bit_depth.
-        amazon_q = AudioQuality(format='flac' if _codec_key(preferred) == 'flac' else 'aac')
+        preferred_codec = _codec_key(preferred)
+        amazon_q = AudioQuality(
+            format='flac' if preferred_codec == 'flac' else preferred_codec
+        )
 
         for item in items:
             quality = _quality_label(preferred)
@@ -237,7 +242,22 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         display_name: str,
     ) -> Optional[str]:
         asin = str(target_id)
-        codecs = CODEC_PREFERENCE if self._allow_fallback else [self._quality]
+        requested_codec = quality_tier_for_source(
+            'amazon', default=self._quality,
+        )
+        if self._allow_fallback:
+            codecs = list(CODEC_PREFERENCE)
+            try:
+                preferred_index = codecs.index(requested_codec)
+                # Fallback means progressively lower tiers. Wrapping to FLAC
+                # after an Opus/EAC3 request violates the item's quality
+                # ceiling and can make the later import guard reject a grab we
+                # should never have started.
+                codecs = codecs[preferred_index:]
+            except ValueError:
+                pass
+        else:
+            codecs = [requested_codec]
         for codec in codecs:
             try:
                 streams = self._client.media_from_asin(asin, codec=codec)
@@ -286,7 +306,7 @@ class AmazonDownloadClient(DownloadSourcePlugin):
             if stream.decryption_key:
                 if self._engine is not None:
                     self._engine.update_record(
-                        "amazon", download_id, {"state": "decrypting", "progress": 1.0}
+                        "amazon", download_id, {"state": "decrypting", "progress": 100.0}
                     )
                 try:
                     self._decrypt_with_ffmpeg(enc_path, out_path, stream.decryption_key)
@@ -382,7 +402,14 @@ class AmazonDownloadClient(DownloadSourcePlugin):
                         {
                             "transferred": downloaded,
                             "size": total,
-                            "progress": downloaded / total if total else 0.0,
+                            # PERCENT, like every other download client. this
+                            # alone reported a 0-1 fraction, which forced the
+                            # shared status normaliser to guess the unit — and
+                            # that guess turned the first 1% of every OTHER
+                            # engine's download into 50-100% on the page
+                            # (0.5 -> 50, 1.0 -> 100). one outlier, four
+                            # victims; fix the outlier.
+                            "progress": (downloaded / total * 100) if total else 0.0,
                         },
                     )
                     last_report = now

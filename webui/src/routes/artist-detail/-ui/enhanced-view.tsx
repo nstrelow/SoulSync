@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { thumb } from '@/platform/artwork-thumb';
 
@@ -12,7 +12,11 @@ import {
   sectionCountLabel,
   sectionTrackTotal,
 } from '../-artist-detail.enhanced';
-import { getAlbumTrackRows } from '../-artist-detail.enhanced-album';
+import {
+  getAlbumTrackRows,
+  loadCanonicalTracks,
+  queueTrackPayload,
+} from '../-artist-detail.enhanced-album';
 import { syncVanillaEnhancedData, syncVanillaSelection } from '../-artist-detail.vanilla-state';
 import { AlbumMetaRow } from './album-meta-row';
 import { ArtistMetaPanel } from './artist-meta-panel';
@@ -270,6 +274,46 @@ function EnhancedAlbumWrapper({
     setAlbum(albumProp);
   }
   const meta = albumRowMeta(album);
+  const rows = getAlbumTrackRows(album);
+  const albumTitle = typeof album.title === 'string' && album.title ? album.title : 'Unknown';
+
+  /**
+   * The canonical tracklist, fetched once the panel opens (library.js:3422).
+   * It is what puts the missing rows into the table, and with them the only
+   * way into "I Have This".
+   *
+   * Keyed on the album record in STATE, with the loading flag as the marker.
+   * Any record without the flags is one the diff has not seen: the first
+   * expand, a refetch from the page, or the fresh record an import hands
+   * back, which is the case that matters most, because the row that was just
+   * filled has to drop out. An in-place edit spreads the flags forward and is
+   * left alone. The result is folded in only while the marker still stands;
+   * a record swapped underneath it drops the stale diff and runs its own.
+   */
+  const artistName = String(artist?.name ?? '');
+  const canonicalSeq = useRef(0);
+  useEffect(() => {
+    if (!expanded || album._canonicalTracksLoaded || album._canonicalTracksLoading) return;
+    const seq = ++canonicalSeq.current;
+    setAlbum((current) => ({ ...current, _canonicalTracksLoading: true }));
+    void loadCanonicalTracks(album, artistName).then((patch) => {
+      if (seq !== canonicalSeq.current) return;
+      setAlbum((current) =>
+        current._canonicalTracksLoading
+          ? { ...current, ...patch, _canonicalTracksLoading: false }
+          : current,
+      );
+    });
+  }, [expanded, album, artistName]);
+
+  const playAlbum = () => {
+    if (!rows.length) {
+      window.showToast?.(`No tracks found for ${albumTitle}`, 'info');
+      return;
+    }
+    const tracks = rows.map((track) => queueTrackPayload(track, album, artist));
+    void window.playTrackList?.(tracks, albumTitle);
+  };
 
   return (
     <div
@@ -306,6 +350,19 @@ function EnhancedAlbumWrapper({
           <span className="enhanced-album-meta-line">{meta.metaLine}</span>
         </div>
 
+        <button
+          type="button"
+          className="enhanced-album-play-btn"
+          aria-label={`Play ${albumTitle}`}
+          title={`Play ${albumTitle}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            playAlbum();
+          }}
+        >
+          ▶
+        </button>
+
         <span className={`enhanced-album-type-badge ${(type || 'album').toLowerCase()}`}>
           {type}
         </span>
@@ -325,7 +382,7 @@ function EnhancedAlbumWrapper({
             <>
               <ExpandedAlbumHeader
                 album={album}
-                rows={getAlbumTrackRows(album)}
+                rows={rows}
                 artistId={artist?.id}
                 artistName={String(artist?.name ?? '')}
                 isAdmin={isAdmin}
