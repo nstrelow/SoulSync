@@ -522,6 +522,10 @@ class ConfigManager:
                 "download_path": "./downloads",
                 "transfer_path": "./Transfer",
                 "max_peer_queue": 0,
+                # Measured transfer speed, not the peer's advertised upload
+                # speed. Opt in explicitly; 0 also disables fallback.
+                "observed_speed_fallback_enabled": False,
+                "min_observed_download_speed_kbps": 250,
                 "download_timeout": 600,
                 # Reddit report (YeloMelo95, Bell Canada): the existing
                 # 35-per-220s sliding-window cap allows all 35 searches in
@@ -536,6 +540,7 @@ class ConfigManager:
                 "min_free_disk_gb": 5.0,
             },
             "download_source": {
+                "max_mb_per_minute": 0,  # Optional advertised music size limit; 0 = off
                 "mode": "soulseek",  # Options: "soulseek", "youtube", "tidal", "qobuz", "hifi", "hybrid", "torrent", "usenet"
                 "hybrid_primary": "soulseek",  # Legacy: primary source for hybrid mode
                 "hybrid_secondary": "youtube",  # Legacy: fallback source for hybrid mode
@@ -833,7 +838,8 @@ class ConfigManager:
                     # Plex both read. Series segments collapse when a book has no
                     # series, exactly as the podcast season folder does.
                     "audiobook_path": "$author/$series/$seriespos - $title",
-                }
+                },
+                "detect_multi_artist_compilations": True,
             },
             "wishlist": {
                 # When discovery finds no catalogue match for a track it stores a

@@ -31,11 +31,16 @@
     "password": "",
     "auto_detect": true
   },
+  "download_source": {
+    "max_mb_per_minute": 0
+  },
   "soulseek": {
     "slskd_url": "http://host.docker.internal:5030",
     "api_key": "",
     "download_path": "/app/downloads",
     "transfer_path": "/app/Transfer",
+    "observed_speed_fallback_enabled": false,
+    "min_observed_download_speed_kbps": 250,
     "search_timeout": 60,
     "search_timeout_buffer": 15
   },

@@ -180,6 +180,37 @@ def test_candidates_tried_in_confidence_order():
     assert deps.download_orchestrator.download_calls[0][1] == "high.flac"
 
 
+def test_observed_speed_fallback_is_retried_only_after_alternatives():
+    class _SequentialSoulseek(_FakeSoulseek):
+        async def download(self, username, filename, size, *, quality_profile_id=None):
+            self.download_calls.append((username, filename, size))
+            self.download_profile_calls.append(quality_profile_id)
+            return 'dl-slow' if filename == 'slow.flac' else None
+
+    soulseek = _SequentialSoulseek()
+    deps = _build_deps(soulseek=soulseek)
+    _seed_task('slow-fallback', used_sources={'slow_slow.flac'})
+    download_tasks['slow-fallback']['_slow_fallback_source_key'] = 'slow_slow.flac'
+    download_tasks['slow-fallback']['_slow_fallback_speed_bps'] = 100_000
+    candidates = [
+        _Candidate(username='slow', filename='slow.flac', confidence=0.99),
+        _Candidate(username='alternative', filename='alternative.flac', confidence=0.5),
+    ]
+
+    result = dc.attempt_download_with_candidates(
+        'slow-fallback', candidates, _Track(), batch_id='b1', deps=deps,
+    )
+
+    assert result is True
+    assert [call[1] for call in soulseek.download_calls] == [
+        'alternative.flac',
+        'slow.flac',
+    ]
+    assert download_tasks['slow-fallback']['download_id'] == 'dl-slow'
+    assert download_tasks['slow-fallback']['_observed_speed_exempt'] is True
+    assert '_slow_fallback_source_key' not in download_tasks['slow-fallback']
+
+
 # ---------------------------------------------------------------------------
 # used_sources dedupe
 # ---------------------------------------------------------------------------
@@ -561,3 +592,19 @@ def test_equal_confidence_candidates_prefer_better_peer_quality():
     dc.attempt_download_with_candidates("t14", candidates, track, batch_id=None, deps=deps)
 
     assert deps.download_orchestrator.download_calls[0][1] == "fast.flac"
+
+
+@pytest.mark.parametrize('smaller_available', [True, False])
+def test_size_limit_skips_oversized_candidate_before_download(monkeypatch, smaller_available):
+    from core.downloads import size_limit
+    monkeypatch.setattr(size_limit, 'configured_limit', lambda: 10)
+    deps = _build_deps()
+    _seed_task('size-cap')
+    track = _Track()
+    track.duration_ms = 210_000
+    rows = [_Candidate(filename='huge.flac', size=180_000_000, confidence=0.99)]
+    if smaller_available:
+        rows.append(_Candidate(filename='small.flac', size=35_000_000, confidence=0.9))
+    result = dc.attempt_download_with_candidates('size-cap', rows, track, deps=deps)
+    assert result is smaller_available
+    assert deps.download_orchestrator.download_calls == ([('user1', 'small.flac', 35_000_000)] if smaller_available else [])

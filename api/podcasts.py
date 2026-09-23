@@ -23,6 +23,15 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
+
+from core.podcast_ingest_guard import (
+    MAX_OPML_BYTES,
+    MAX_REDIRECTS,
+    check_url,
+    has_fetchable_scheme,
+    parse_xml_safely,
+)
 
 import requests
 from flask import Blueprint, Response, jsonify, request
@@ -45,6 +54,36 @@ logger = get_logger("podcasts.api")
 _download_lock = threading.Lock()
 _downloads: Dict[str, Dict[str, Any]] = {}
 _download_client: Optional[PodcastDownloadClient] = None
+
+# how many episodes download at once. every queued episode used to get its
+# own thread the moment it was queued; the batch's max_concurrent was a
+# number nobody read, and one scan across a few shows with a backlog opened
+# every download at the same time. the rest now wait in line as "queued".
+DEFAULT_MAX_CONCURRENT_DOWNLOADS = 3
+_download_slots: Optional[threading.BoundedSemaphore] = None
+_download_slots_size = 0
+_download_slots_lock = threading.Lock()
+
+
+def _max_concurrent_downloads() -> int:
+    try:
+        from core.settings import config_manager
+        value = int(config_manager.get("podcasts.max_concurrent_downloads",
+                                       DEFAULT_MAX_CONCURRENT_DOWNLOADS) or 0)
+    except Exception:
+        value = DEFAULT_MAX_CONCURRENT_DOWNLOADS
+    return max(1, min(10, value))
+
+
+def _download_slot_semaphore() -> threading.BoundedSemaphore:
+    """the shared limiter, rebuilt if the setting changed since it was made."""
+    global _download_slots, _download_slots_size
+    size = _max_concurrent_downloads()
+    with _download_slots_lock:
+        if _download_slots is None or _download_slots_size != size:
+            _download_slots = threading.BoundedSemaphore(size)
+            _download_slots_size = size
+        return _download_slots
 
 # Cache for featured, search results, and parsed show feeds
 _featured_cache: Dict[str, Dict[str, Any]] = {}
@@ -131,6 +170,72 @@ def show_to_dict(show: PodcastShow, include_episodes: bool = True) -> Dict[str, 
     return d
 
 
+def _with_downloaded_flags(show_data: Dict[str, Any], feed_url: str) -> Dict[str, Any]:
+    """the show with each episode saying whether it is on disk.
+
+    the page used to learn "downloaded" only from the in-memory download
+    list, which a restart empties: every episode looked downloadable again
+    and a click fetched it a second time. the database remembers; this is
+    read per request, after the feed cache, so it is never stale. a pruned
+    episode (retention took the file) is not on disk and reads as not
+    downloaded, which is what a manual click should see."""
+    db = _db()
+    if not db or not feed_url:
+        return show_data
+    try:
+        rows = db.get_downloaded_podcast_episodes(feed_url=feed_url, unpruned_only=True)
+    except Exception as exc:
+        logger.debug("Could not read downloaded episodes for %s: %s", feed_url[:80], exc)
+        return show_data
+    on_disk = {}
+    for row in rows:
+        if not row.get("file_path"):
+            continue
+        for key in (row.get("enclosure_url"), row.get("guid")):
+            if key:
+                on_disk[str(key)] = row["file_path"]
+    if not on_disk:
+        return show_data
+    episodes = []
+    for ep in show_data.get("episodes") or []:
+        path = on_disk.get(str(ep.get("enclosure_url") or "")) or on_disk.get(str(ep.get("guid") or ""))
+        episodes.append({**ep, "downloaded": True, "file_path": path} if path else ep)
+    return {**show_data, "episodes": episodes}
+
+
+# ---------------------------------------------------------------------------
+# Proxy helper
+# ---------------------------------------------------------------------------
+
+def _proxy_get_following_checked_redirects(url: str, headers: dict):
+    """GET a checked url for streaming, re-checking every redirect hop.
+
+    fetch_guarded in the ingest guard buffers its body, which is right for a
+    feed and wrong here: this proxy forwards Range requests so seeking inside
+    an episode works, and that means handing back the live response. Same rule
+    though - requests would follow a 302 to anywhere, so the hops are walked by
+    hand and each one goes back through check_url.
+
+    Returns the response, or None when a hop is refused or the chain is too long.
+    """
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        ok, reason = check_url(current)
+        if not ok:
+            logger.warning("audio-proxy refused a redirect hop: %s (%s)", current[:120], reason)
+            return None
+        resp = requests.get(current, headers=headers, stream=True,
+                            timeout=15, allow_redirects=False)
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            return resp
+        location = resp.headers.get("Location") or ""
+        resp.close()
+        if not location:
+            return None
+        current = urljoin(current, location)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # OPML Helpers
 # ---------------------------------------------------------------------------
@@ -150,7 +255,11 @@ def parse_opml_content(content: str | bytes) -> List[Dict[str, str]]:
         else:
             content_bytes = content
 
-        root = ET.fromstring(content_bytes)
+        # an opml file is uploaded, so it is untrusted the same way a feed is.
+        # parse_xml_safely refuses a DOCTYPE, which is the whole billion-laughs
+        # family - stdlib ElementTree will not fetch an external entity but it
+        # expands internal ones happily.
+        root = parse_xml_safely(content_bytes)
     except Exception as exc:
         logger.warning("Failed to parse OPML XML: %s", exc)
         return []
@@ -193,6 +302,14 @@ def parse_opml_content(content: str | bytes) -> List[Dict[str, str]]:
         ).strip()
         description = (outline.get("description") or "").strip()
         html_url = (outline.get("htmlUrl") or outline.get("htmlurl") or "").strip()
+
+        # an opml file is a list of urls somebody else wrote, so a scheme we do
+        # not fetch is dropped here rather than stored and retried on a timer
+        # forever. only the scheme: whether a HOST is private is a dns question,
+        # and check_url asks it at fetch time, where the answer is still true.
+        if not has_fetchable_scheme(xml_url):
+            logger.warning("OPML import skipped a feed URL we cannot fetch: %s", xml_url[:120])
+            continue
 
         feeds.append({
             "title": title or xml_url,
@@ -252,6 +369,32 @@ def generate_opml_content(shows: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Background Download Queuing
 # ---------------------------------------------------------------------------
+
+def _finish_without_download(download_id: str, task_id: str, status: str, error: str,
+                             feed_url: str, enclosure_url: str) -> None:
+    """a download that did not land: the placeholder row that was written at
+    queue time goes, so the next scan tries again instead of treating the
+    episode as downloaded forever, and then the card says so. the record
+    first, the card second: anything that reacts to the card's state finds
+    the truth already written."""
+    db = _db()
+    if db and feed_url and enclosure_url:
+        try:
+            db.forget_podcast_episode_attempt(feed_url=feed_url, enclosure_url=enclosure_url)
+        except Exception as exc:
+            logger.debug("Could not drop the podcast download placeholder: %s", exc)
+    with tasks_lock:
+        task = download_tasks.get(task_id)
+        if task:
+            task["status"] = status
+            task["error_message"] = error
+            task["status_change_time"] = time.time()
+    with _download_lock:
+        rec = _downloads.get(download_id)
+        if rec:
+            rec["status"] = "cancelled" if status == "cancelled" else "error"
+            rec["error"] = error
+
 
 def queue_podcast_download(data: Dict[str, Any]) -> Dict[str, Any]:
     """Queue background download of a podcast episode and register it in download_tasks."""
@@ -376,6 +519,25 @@ def queue_podcast_download(data: Dict[str, Any]) -> Dict[str, Any]:
 
     # Run background worker thread
     def _worker():
+        slots = _download_slot_semaphore()
+        # wait for a slot as "queued". a cancel while waiting is honoured
+        # before any byte moves.
+        while not slots.acquire(timeout=1.0):
+            with tasks_lock:
+                t = download_tasks.get(task_id)
+                waiting_cancelled = bool(t and (t.get("cancel_requested") or t.get("status") == "cancelled"))
+            with _download_lock:
+                rec = _downloads.get(download_id)
+                waiting_cancelled = waiting_cancelled or bool(rec and rec.get("status") == "cancelled")
+            if waiting_cancelled:
+                _finish_without_download(download_id, task_id, "cancelled", "Download cancelled", feed_url, enclosure_url)
+                return
+        try:
+            _run_download()
+        finally:
+            slots.release()
+
+    def _run_download():
         with tasks_lock:
             if "podcasts" in download_batches:
                 download_batches["podcasts"]["active_count"] = (
@@ -542,32 +704,10 @@ def queue_podcast_download(data: Dict[str, Any]) -> Dict[str, Any]:
 
         except (InterruptedError, KeyboardInterrupt):
             logger.info("Podcast download cancelled: %s", title)
-            with tasks_lock:
-                task = download_tasks.get(task_id)
-                if task:
-                    task["status"] = "cancelled"
-                    task["error_message"] = "Download cancelled"
-                    task["status_change_time"] = time.time()
-            with _download_lock:
-                rec = _downloads.get(download_id)
-                if rec:
-                    rec["status"] = "cancelled"
-                    rec["error"] = "Download cancelled"
-
+            _finish_without_download(download_id, task_id, "cancelled", "Download cancelled", feed_url, enclosure_url)
         except Exception as exc:
             logger.error("Podcast download failed for %s: %s", title, exc)
-            with tasks_lock:
-                task = download_tasks.get(task_id)
-                if task:
-                    task["status"] = "failed"
-                    task["error_message"] = str(exc)
-                    task["status_change_time"] = time.time()
-            with _download_lock:
-                rec = _downloads.get(download_id)
-                if rec:
-                    rec["status"] = "error"
-                    rec["error"] = str(exc)
-
+            _finish_without_download(download_id, task_id, "failed", str(exc), feed_url, enclosure_url)
         finally:
             with tasks_lock:
                 if "podcasts" in download_batches:
@@ -705,7 +845,7 @@ def create_podcasts_blueprint() -> Blueprint:
         now = time.time()
         cached_show = _show_cache.get(feed_url)
         if cached_show and (now - cached_show["timestamp"]) < _SHOW_CACHE_TTL:
-            return jsonify({"success": True, "show": cached_show["show"]})
+            return jsonify({"success": True, "show": _with_downloaded_flags(cached_show["show"], feed_url)})
 
         show = client.fetch_feed(feed_url, show_hint=show_hint)
         if show is None:
@@ -714,7 +854,7 @@ def create_podcasts_blueprint() -> Blueprint:
         show_data = show_to_dict(show, include_episodes=True)
         _show_cache[feed_url] = {"timestamp": now, "show": show_data}
 
-        return jsonify({"success": True, "show": show_data})
+        return jsonify({"success": True, "show": _with_downloaded_flags(show_data, feed_url)})
 
     @bp.route("/download", methods=["POST"])
     def download_episode():
@@ -748,6 +888,18 @@ def create_podcasts_blueprint() -> Blueprint:
         if not target_url:
             return jsonify({"error": "Missing url parameter"}), 400
 
+        # this endpoint takes a url from the query string and fetches it from
+        # the server, which is an open relay into whatever network soulsync is
+        # running on unless it is checked. the audiobook sample proxy says the
+        # same thing about itself and solves it with an allowlist; podcast audio
+        # comes from thousands of cdns so there is no list, and the check is on
+        # the address instead. login is off by default, so anyone who can reach
+        # the web ui could otherwise read internal http services through this.
+        ok, reason = check_url(target_url)
+        if not ok:
+            logger.warning("audio-proxy refused a URL: %s (%s)", target_url[:120], reason)
+            return jsonify({"error": reason}), 400
+
         headers = {}
         if "Range" in request.headers:
             headers["Range"] = request.headers["Range"]
@@ -758,7 +910,12 @@ def create_podcasts_blueprint() -> Blueprint:
         )
 
         try:
-            req = requests.get(target_url, headers=headers, stream=True, timeout=15)
+            # redirects are NOT followed: the check above applies to the url we
+            # were handed, and a 302 could point anywhere. real enclosure hosts
+            # do redirect, so a hop is re-checked and followed by hand.
+            req = _proxy_get_following_checked_redirects(target_url, headers)
+            if req is None:
+                return jsonify({"error": "That host redirected somewhere SoulSync will not fetch"}), 502
             forward_headers = {}
             for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
                 if h in req.headers:
@@ -811,7 +968,8 @@ def create_podcasts_blueprint() -> Blueprint:
             return jsonify({"success": True, "is_watching": False, "podcast": None})
 
         try:
-            pod = db.get_watchlist_podcast(feed_url=feed_url or None, itunes_id=itunes_id)
+            pod = db.get_watchlist_podcast(feed_url=feed_url or None, itunes_id=itunes_id,
+                                          profile_id=_profile())
             is_watching = pod is not None
             return jsonify({"success": True, "is_watching": is_watching, "podcast": pod})
         except Exception as exc:
@@ -875,7 +1033,7 @@ def create_podcasts_blueprint() -> Blueprint:
                 episode_count=episode_count,
                 profile_id=profile_id,
             )
-            pod = db.get_watchlist_podcast(feed_url=feed_url)
+            pod = db.get_watchlist_podcast(feed_url=feed_url, profile_id=profile_id)
             return jsonify({"success": bool(ok), "is_watching": True, "podcast": pod})
         except Exception as exc:
             logger.exception("podcasts_watchlist_add failed for %s: %s", title, exc)
@@ -900,7 +1058,8 @@ def create_podcasts_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": "database unavailable"}), 500
 
         try:
-            ok = db.remove_watchlist_podcast(feed_url=feed_url or None, itunes_id=itunes_id)
+            ok = db.remove_watchlist_podcast(feed_url=feed_url or None, itunes_id=itunes_id,
+                                            profile_id=_profile())
             return jsonify({"success": bool(ok), "is_watching": False})
         except Exception as exc:
             logger.exception("podcasts_watchlist_remove failed: %s", exc)
@@ -934,8 +1093,9 @@ def create_podcasts_blueprint() -> Blueprint:
                 feed_url,
                 auto_download=auto_download,
                 retention_days=retention_days,
+                profile_id=_profile(),
             )
-            pod = db.get_watchlist_podcast(feed_url=feed_url)
+            pod = db.get_watchlist_podcast(feed_url=feed_url, profile_id=_profile())
             return jsonify({"success": bool(ok), "podcast": pod})
         except Exception as exc:
             logger.exception("podcasts_watchlist_settings failed for %s: %s", feed_url, exc)
@@ -946,7 +1106,8 @@ def create_podcasts_blueprint() -> Blueprint:
         """Trigger an immediate scan of all watchlisted podcast feeds."""
         try:
             from core.podcast_automation import scan_and_auto_download_podcasts
-            res = scan_and_auto_download_podcasts()
+            # a person pressing Scan Now means their own shows, not profile 1's
+            res = scan_and_auto_download_podcasts(profile_id=_profile())
             return jsonify(res), 200
         except Exception as exc:
             logger.exception("Failed to run podcast scan: %s", exc)
@@ -1009,10 +1170,22 @@ def create_podcasts_blueprint() -> Blueprint:
             action = "subscribe"
         elif "file" in request.files:
             uploaded = request.files["file"]
-            raw_content = uploaded.read()
+            # read one byte past the cap so a file that is exactly at the limit
+            # still imports and anything larger is refused rather than truncated
+            raw_content = uploaded.read(MAX_OPML_BYTES + 1)
+            if len(raw_content) > MAX_OPML_BYTES:
+                return jsonify({
+                    "success": False,
+                    "error": f"That OPML file is larger than {MAX_OPML_BYTES // (1024 * 1024)}MB",
+                }), 413
             feeds = parse_opml_content(raw_content)
         else:
             content = body_json.get("opml_text") or body_json.get("xml") or ""
+            if len(content) > MAX_OPML_BYTES:
+                return jsonify({
+                    "success": False,
+                    "error": f"That OPML document is larger than {MAX_OPML_BYTES // (1024 * 1024)}MB",
+                }), 413
             if content:
                 feeds = parse_opml_content(content)
             else:

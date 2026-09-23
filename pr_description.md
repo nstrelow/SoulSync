@@ -1,47 +1,47 @@
-# soulsync 3.3.3: `dev` → `main`
+# soulsync 3.4.4: `dev` → `main`
 
-chat that reaches people outside your install, smarter release parsing, self-hosted musicbrainz, and a discover pass.
+separate music libraries and server accounts per profile, safer deep scans, and fixes for sync reporting, downloads, automations and chat. scope: the 23 commits since the 3.4.3 release commit (`7bc2650d3`).
 
-## chat, beyond soulsync
+## pending fix: mp3 quality upgrades (#1270)
 
-messages go both ways with people who aren't running soulsync, and the history sticks around. overlay templates can be shared straight into a room, picked from a modal.
+- the finder could flag an mp3 below the selected bitrate, but import compared only extensions and discarded the better mp3 as redundant. finder-approved wishlist items now authorize a measured improvement under their assigned quality profile, without enabling force replacement for other wishlist items.
+- original filenames are reused, mp3-only targets do not accept flac replacements, and unreadable or non-improving files cannot overwrite the library. integrity and length checks remain in place; a different-format original is retired only after successful publication.
+- reproduced the failure before fixing it; the focused import, quality, wishlist and finder run passed 1,672 tests with 8 skips. final full-suite validation is pending.
 
-## release parsing
+## a library of your own
 
-reads the actual bitrate, sample rate and codec first and only falls back to the uploader's title, the way lidarr does. a repack wins the tie as the corrected copy. quality now survives the whole source pipeline, so a complete album can't fall back to a worse copy than one already found. lossless preview clips get caught on import. you can say which indexer you trust, and usenet results show the post age. built on #1224 from nick2000713.
+- each profile can use its own music folder and server library (#1199), with its downloads, scans, ownership checks, watchlist and playlist folders scoped to that library. the admin stays on the shared library; another person's copy does not count as yours.
+- the folder is prefilled, checked when saved, and rejected if it overlaps the shared library or another profile's folder. docker compose includes a default mount path for personal libraries.
+- scans and download workers carry the owning profile through background work. jellyfin artists shared across server libraries keep their albums in the right library, and ownership filtering keeps indexed searches fast.
 
-## self-hosted musicbrainz
+## your playlists on your server account
 
-point soulsync at your own server, in settings under Connections.
+- choose a plex home user or a personal navidrome login for your profile so synced playlists land on your account. jellyfin uses a profile-specific client view instead of changing the shared client's user.
+- two profiles syncing at once keep their own identity. personal settings shows the active server's account controls, the jellyfin user picker loads correctly, and user-library lookups run in parallel and cache their results.
+- a failed jellyfin connection can be retried instead of being remembered permanently. a second admin gets the same music-side admin access as the first.
 
-## concerts on the artist page
+## deep scans keep records when the server fails
 
-upcoming dates and real setlists, via ticketmaster.
+- a timeout used to look like an empty artist or album, leaving its tracks eligible for deletion. unverified listings now preserve the affected rows and report the failure; cancelling a scan skips stale-row removal.
+- jellyfin artist and album listings now page beyond their old 200-album and 100-track limits. incomplete bulk listings fall back to individual fetches. genuinely removed items are still cleaned up.
 
-## video
+## sync and download reporting
 
-detail page polish and movie sync fixes. the dashboard shows what's downloading right now with posters. continue watching reads your real resume position. torrent grabs track properly, a refused grab says why, seed removal is honoured in client mode, and EXT.to magnets resolve after selection.
+- when several source entries match the same library file, sync reports what was folded together, names the entries in the log, and includes the folded count in the finished card. the review data retains the library artist and album, and deezer's album-loading progress explains its two passes.
+- cancelling the last track, cancelling a whole batch, and batch healing now close sync history instead of leaving it in progress forever. slow tag, playlist-folder and repair work runs outside the task lock so status updates and other batches can continue.
 
-## discover
+## automations and cleanup
 
-play buttons on mix cards and track rows now play. playback is confirmed by the player before it's reported, so you know when audio actually started. a mix resolves against your library in one query instead of one per track, so it starts in about a second.
+- weekly cleanup can clear the download quarantine and recycle bin. it ships disabled, with separate controls for each part. the recycle bin follows its retention window; enabling cleanup with keep forever selected empties it.
+- interval automations that missed a scheduled run catch up soon after restart. the last.fm listens notification closes when its work finishes.
 
-hero controls sit in their own row on both pages, cards and dialogs work by keyboard and touch, and the taste dial is a real slider.
+## chat
 
-on video: browsing keeps the newest search's results, a failed request says so instead of showing an empty shelf, and Not Interested removes every copy of a title with an Undo.
+- messages sent from #bugs stay in #bugs, and multiline plain-text messages reach the selected room.
+- dismissed closed polls stay dismissed after refresh.
 
-## tools
+## validation
 
-split into Tools and Operations. artist views are named Discography and Your library. "cleanup recommended" says what it means.
-
-## notifications
-
-ntfy and gotify are real actions now.
-
-## also
-
-- an error page shows the actual error with a copy button, so a report has something in it
-- play the album you own instead of downloading it
-- the upgrade backlog is sorted worst-first and folded to albums
-- self-service profile credentials, and switching login profiles asks for the password
-- less idle polling and fewer broad soulseek searches
+- fixed the nine CI failures caused by outdated ownership-schema fixtures and a source-lookup fake missing its scope method.
+- all 51 tests in the four affected modules and the own-library profile suite passed. the supplied full-suite run had 19,086 passes and those nine failures; a new full-suite green run has not been verified.
+- release checks: 162 helper, script-loading and web-asset tests passed; helper.js passed node syntax checking; the discord draft is 1,519 characters.

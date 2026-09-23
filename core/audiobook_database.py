@@ -9,7 +9,8 @@ solved this by living in database/video_library.db, and audiobooks follow the
 same rule: a new file, a new connection, nothing shared. A bug in here cannot
 corrupt, lock, or migrate anything the music side reads.
 
-ASIN is the identity throughout, the same key the catalog client uses.
+Catalogue entries use ASINs. Unidentified library files use local: keys,
+which are excluded from catalogue ownership checks.
 
 Schema changes ride _COLUMN_MIGRATIONS rather than being edited into the CREATE
 TABLE statements, because an existing install has already run the CREATE and
@@ -39,7 +40,9 @@ STATUS_GRABBED = "grabbed"      # handed to a download client, not yet imported
 STATUS_DONE = "done"            # imported into the library
 STATUS_FAILED = "failed"        # last attempt failed; retried on a later pass
 
-_STATUSES = (STATUS_WANTED, STATUS_SEARCHING, STATUS_GRABBED, STATUS_DONE, STATUS_FAILED)
+STATUS_CANCELLED = "cancelled"  # explicitly stopped; never automatically retried
+
+_STATUSES = (STATUS_WANTED, STATUS_SEARCHING, STATUS_GRABBED, STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
 
 # Whether a wishlisted book must be downloaded in the narrator's reading it was
 # wished for. On Audible the narrator is baked into the ASIN, so picking a book
@@ -53,7 +56,32 @@ _NARRATOR_MODES = (NARRATOR_EXACT, NARRATOR_ANY)
 # added only to CREATE TABLE arrives for fresh installs and silently never
 # appears for anyone already running.
 _COLUMN_MIGRATIONS = (
+    ("audiobook_downloads", "imported_path", "TEXT DEFAULT ''"),
+    ("audiobook_library", "catalog_asin", "TEXT DEFAULT ''"),
+    ("audiobook_library", "match_status", "TEXT DEFAULT 'unmatched'"),
+    ("audiobook_library", "match_score", "REAL DEFAULT 0"),
+    ("audiobook_library", "match_candidates", "TEXT DEFAULT '[]'"),
+    ("audiobook_library", "match_evidence", "TEXT DEFAULT '[]'"),
+    ("audiobook_library", "catalog_book", "TEXT DEFAULT '{}'"),
+    ("audiobook_library", "match_checked_at", "REAL DEFAULT 0"),
+    ("audiobook_library", "match_revision", "INTEGER DEFAULT 0"),
+    ("audiobook_library", "origin", "TEXT DEFAULT 'unknown'"),
+    ("audiobook_library", "download_id", "TEXT DEFAULT ''"),
+    ("audiobook_library", "file_paths", "TEXT DEFAULT '[]'"),
+    ("audiobook_library", "file_scope", "TEXT DEFAULT 'folder'"),
+    ("audiobook_library", "fingerprint", "TEXT DEFAULT ''"),
+    ("audiobook_library", "metadata_json", "TEXT DEFAULT '{}'"),
+    ("audiobook_library", "grouping", "TEXT DEFAULT ''"),
+
+    ("audiobook_library", "cover_url", "TEXT DEFAULT ''"),
+    ("audiobook_library", "source", "TEXT DEFAULT 'download'"),
+    ("audiobook_library", "scan_signature", "TEXT DEFAULT ''"),
     ("audiobook_wishlist", "narrator_mode", f"TEXT DEFAULT '{NARRATOR_EXACT}'"),
+    # When the row last CHANGED STATE, which is not when it was last attempted:
+    # last_attempt_at only moves when count_attempt is passed, and a user action
+    # deliberately does not count as an attempt. Freeing a row stuck on
+    # "grabbed" needs to know how long it has been grabbed, so it needs this.
+    ("audiobook_wishlist", "status_changed_at", "REAL DEFAULT 0"),
     # Why a download is staged rather than imported, in the user's words.
     ("audiobook_downloads", "completeness", "TEXT DEFAULT ''"),
     # The whole book as the catalogue described it AT GRAB TIME. Importing needs
@@ -296,6 +324,15 @@ class AudiobookDatabase:
                 "ON audiobook_blocklist (asin)"
             )
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audiobook_library_scan_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    payload TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""CREATE TABLE IF NOT EXISTS audiobook_library_file_cache (
+                path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+                payload TEXT NOT NULL)""")
             self._apply_column_migrations(cursor)
             conn.commit()
             self._initialized = True
@@ -312,6 +349,14 @@ class AudiobookDatabase:
                 existing = {row["name"] for row in cursor.execute(f"PRAGMA table_info({table})")}
                 if column not in existing:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    if table == "audiobook_library" and column == "catalog_asin":
+                        cursor.execute("UPDATE audiobook_library SET catalog_asin = asin WHERE asin NOT LIKE 'local:%'")
+                    if table == "audiobook_library" and column == "match_status":
+                        cursor.execute("UPDATE audiobook_library SET match_status = 'identifier' WHERE catalog_asin != ''")
+                    if table == "audiobook_library" and column == "origin" and "source" in {
+                        r["name"] for r in cursor.execute("PRAGMA table_info(audiobook_library)")
+                    }:
+                        cursor.execute("UPDATE audiobook_library SET origin = 'disk' WHERE source = 'scan'")
                     logger.info("Added %s.%s to the audiobook database", table, column)
             except sqlite3.Error as exc:
                 logger.warning("Audiobook column migration %s.%s failed: %s", table, column, exc)
@@ -382,6 +427,19 @@ class AudiobookDatabase:
             logger.warning("Could not remove %s from the audiobook wishlist: %s", asin, exc)
             return False
 
+    def clear_wishlist(self, profile_id: int = 1) -> int:
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM audiobook_wishlist WHERE profile_id = ?",
+                (int(profile_id),),
+            )
+            conn.commit()
+            return cursor.rowcount
+        except sqlite3.Error as exc:
+            logger.warning("Could not clear audiobook wishlist for profile %s: %s", profile_id, exc)
+            return 0
+
     def is_wishlisted(self, asin: str, profile_id: int = 1) -> bool:
         conn = self._connect()
         row = conn.execute(
@@ -390,9 +448,19 @@ class AudiobookDatabase:
         ).fetchone()
         return row is not None
 
+    def get_wishlist_entry(self, asin: str, profile_id: int = 1) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        sql = """SELECT *, (SELECT d.status FROM audiobook_downloads d
+                 WHERE d.asin = audiobook_wishlist.asin ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1) AS download_status
+                 FROM audiobook_wishlist WHERE asin = ? AND profile_id = ?"""
+        row = conn.execute(sql, (str(asin or "").strip(), int(profile_id))).fetchone()
+        return self._wishlist_row(row) if row else None
+
     def get_wishlist(self, profile_id: int = 1, status: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self._connect()
-        sql = "SELECT * FROM audiobook_wishlist WHERE profile_id = ?"
+        sql = """SELECT *, (SELECT d.status FROM audiobook_downloads d
+                 WHERE d.asin = audiobook_wishlist.asin ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1) AS download_status
+                 FROM audiobook_wishlist WHERE profile_id = ?"""
         params: List[Any] = [int(profile_id)]
         if status:
             sql += " AND status = ?"
@@ -405,23 +473,35 @@ class AudiobookDatabase:
         profile_id: int = 1,
         retry_after_seconds: float = 6 * 3600,
         limit: int = 20,
+        due_only: bool = True,
     ) -> List[Dict[str, Any]]:
         """Rows the next search pass should try.
 
         Anything wanted or previously failed, whose last attempt is older than
-        the backoff. Rows already grabbed or done are never retried, and rows
-        marked searching are skipped so two passes cannot both claim one.
+        the backoff (when due_only=True). When due_only=False, skips the backoff check
+        so manual search sweeps inspect all wanted/failed books. Rows already grabbed
+        or done are never retried, and rows marked searching are skipped so two
+        passes cannot both claim one.
         """
         conn = self._connect()
-        cutoff = _now() - max(0.0, float(retry_after_seconds))
-        rows = conn.execute("""
-            SELECT * FROM audiobook_wishlist
-            WHERE profile_id = ?
-              AND status IN (?, ?)
-              AND last_attempt_at <= ?
-            ORDER BY last_attempt_at ASC, added_at ASC
-            LIMIT ?
-        """, (int(profile_id), STATUS_WANTED, STATUS_FAILED, cutoff, max(1, int(limit))))
+        if due_only:
+            cutoff = _now() - max(0.0, float(retry_after_seconds))
+            rows = conn.execute("""
+                SELECT * FROM audiobook_wishlist
+                WHERE profile_id = ?
+                  AND status IN (?, ?)
+                  AND last_attempt_at <= ?
+                ORDER BY last_attempt_at ASC, added_at ASC
+                LIMIT ?
+            """, (int(profile_id), STATUS_WANTED, STATUS_FAILED, cutoff, max(1, int(limit))))
+        else:
+            rows = conn.execute("""
+                SELECT * FROM audiobook_wishlist
+                WHERE profile_id = ?
+                  AND status IN (?, ?)
+                ORDER BY last_attempt_at ASC, added_at ASC
+                LIMIT ?
+            """, (int(profile_id), STATUS_WANTED, STATUS_FAILED, max(1, int(limit))))
         return [self._wishlist_row(row) for row in rows]
 
     def reset_stale_searching(self, older_than_seconds: float = 3600.0,
@@ -454,11 +534,60 @@ class AudiobookDatabase:
             logger.warning("Could not free stale searching rows: %s", exc)
             return 0
 
+    def reset_stale_grabbed(self, older_than_seconds: float = 21600.0,
+                            profile_id: int = 1) -> int:
+        """Free rows handed to a download client that nothing is following.
+
+        A row goes to "grabbed" the moment a client accepts the release, and it
+        is the download MONITOR that moves it off again — to done when the book
+        imports, to failed when the client gives up. The monitor only looks at
+        rows with an ACTIVE download, so if that download row never arrives, or
+        is cleared, or the monitor itself stops running, the wishlist row sits
+        on "grabbed" forever. The user sees "sent to downloads" against a book
+        with nothing downloading, and no pass ever picks it up again because the
+        retry query only takes "wanted" and "failed".
+
+        Same shape as reset_stale_searching, and the same reasoning: a state
+        that only something ELSE can clear needs a way back when that something
+        does not run.
+
+        A row is only freed when it has no live download to explain it, so a
+        book genuinely sitting in a slow torrent is left alone however long it
+        takes. The age gate is generous for the same reason — a large audiobook
+        on a thin swarm is normal.
+        """
+        cutoff = _now() - max(0.0, float(older_than_seconds))
+        conn = self._connect()
+        try:
+            cursor = conn.execute("""
+                UPDATE audiobook_wishlist
+                SET status = ?,
+                    last_error = 'Sent to downloads, but nothing was tracking it'
+                WHERE profile_id = ?
+                  AND status = ?
+                  AND status_changed_at > 0
+                  AND status_changed_at <= ?
+                  AND asin NOT IN (
+                      SELECT asin FROM audiobook_downloads
+                      WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                  )
+            """, (STATUS_WANTED, int(profile_id), STATUS_GRABBED, cutoff))
+            conn.commit()
+            if cursor.rowcount:
+                logger.info(
+                    "Freed %d audiobook wishlist rows stuck on grabbed with no live download",
+                    cursor.rowcount,
+                )
+            return cursor.rowcount
+        except sqlite3.Error as exc:
+            logger.warning("Could not free stale grabbed rows: %s", exc)
+            return 0
+
     def mark_wishlist_status(
         self,
         asin: str,
         status: str,
-        profile_id: int = 1,
+        profile_id: Optional[int] = 1,
         error: str = "",
         count_attempt: bool = False,
     ) -> bool:
@@ -467,24 +596,31 @@ class AudiobookDatabase:
         ``count_attempt`` is what drives the backoff, and it is deliberately
         separate from the status: a pass that finds nothing must increment it,
         while a user re-adding a book must not.
+
+        ``profile_id=None`` means every profile's row for this asin: the
+        download monitor knows the book, not who wanted it, and a book that
+        just imported is in the library for everyone.
         """
         if status not in _STATUSES:
             return False
+        scope = "" if profile_id is None else " AND profile_id = ?"
+        params_tail = [str(asin or "").strip()] + ([] if profile_id is None else [int(profile_id)])
         conn = self._connect()
         try:
             if count_attempt:
-                cursor = conn.execute("""
+                cursor = conn.execute(f"""
                     UPDATE audiobook_wishlist
                     SET status = ?, last_error = ?, last_attempt_at = ?,
+                        status_changed_at = ?,
                         attempt_count = attempt_count + 1
-                    WHERE asin = ? AND profile_id = ?
-                """, (status, str(error or ""), _now(), str(asin or "").strip(), int(profile_id)))
+                    WHERE asin = ?{scope}
+                """, [status, str(error or ""), _now(), _now(), *params_tail])
             else:
-                cursor = conn.execute("""
+                cursor = conn.execute(f"""
                     UPDATE audiobook_wishlist
-                    SET status = ?, last_error = ?
-                    WHERE asin = ? AND profile_id = ?
-                """, (status, str(error or ""), str(asin or "").strip(), int(profile_id)))
+                    SET status = ?, last_error = ?, status_changed_at = ?
+                    WHERE asin = ?{scope}
+                """, [status, str(error or ""), _now(), *params_tail])
             conn.commit()
             return cursor.rowcount > 0
         except sqlite3.Error as exc:
@@ -512,6 +648,56 @@ class AudiobookDatabase:
         except sqlite3.Error as exc:
             logger.warning("Could not set the narrator mode for %s: %s", asin, exc)
             return False
+
+    def retry_wishlist_entry(self, asin: str, profile_id: int = 1) -> bool:
+        """Want it again, now.
+
+        The way back from "cancelled" (never retried on its own) and the way to
+        skip the backoff on "failed" without removing and re-adding the book,
+        which would also throw away the narrator choice. Attempts are kept:
+        the count is history, and the backoff is what is being waived.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute("""
+                UPDATE audiobook_wishlist
+                SET status = ?, last_error = '', last_attempt_at = 0, status_changed_at = ?
+                WHERE asin = ? AND profile_id = ? AND status IN (?, ?, ?)
+            """, (STATUS_WANTED, _now(), str(asin or "").strip(), int(profile_id),
+                  STATUS_FAILED, STATUS_CANCELLED, STATUS_GRABBED))
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as exc:
+            logger.warning("Could not retry wishlist entry %s: %s", asin, exc)
+            return False
+
+    def mark_owned_wishlist_done(self) -> int:
+        """Every wanted row whose book is already in the library becomes done.
+
+        Ownership used to be checked only when a pass reached the row, so a
+        book copied in by hand showed "Looking" for as long as the backoff and
+        the batch size kept it out of the next few passes. Every profile: the
+        library is shared.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute("""
+                UPDATE audiobook_wishlist
+                SET status = ?, last_error = '', status_changed_at = ?
+                WHERE status != ?
+                  AND asin IN (
+                      SELECT catalog_asin FROM audiobook_library
+                      WHERE match_status IN ('identifier', 'automatic', 'confirmed')
+                  )
+            """, (STATUS_DONE, _now(), STATUS_DONE))
+            conn.commit()
+            if cursor.rowcount:
+                logger.info("%d wishlisted audiobook(s) are already in the library; marked done",
+                            cursor.rowcount)
+            return cursor.rowcount
+        except sqlite3.Error as exc:
+            logger.warning("Could not reconcile the wishlist with the library: %s", exc)
+            return 0
 
     def wishlist_counts(self, profile_id: int = 1) -> Dict[str, int]:
         conn = self._connect()
@@ -866,9 +1052,24 @@ class AudiobookDatabase:
             # 'staged' is active on purpose: a book held back for missing
             # chapters must keep being re-checked, because the usual reason is a
             # torrent that has not finished yet.
-            sql += " WHERE status IN ('queued', 'downloading', 'importing', 'staged')"
+            sql += " WHERE status IN ('queued', 'downloading', 'importing', 'staged', 'paused', 'unavailable')"
         sql += " ORDER BY created_at DESC"
         return [dict(row) for row in conn.execute(sql)]
+
+    def cancel_active_downloads(self, task_ids=None):
+        """Persist cancellation before runtime cleanup can erase its signal."""
+        conn = self._connect()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = self.get_downloads(active_only=True)
+            if task_ids is not None:
+                rows = [r for r in rows if r['download_id'] in task_ids]
+            for row in rows:
+                conn.execute("UPDATE audiobook_downloads SET status='cancelled', error='Cancelled by you', updated_at=? WHERE download_id=?",
+                             (_now(), row['download_id']))
+                conn.execute("UPDATE audiobook_wishlist SET status='cancelled', last_error='', status_changed_at=? WHERE asin=? AND status='grabbed' AND NOT EXISTS (SELECT 1 FROM audiobook_downloads d WHERE d.asin=audiobook_wishlist.asin AND d.status IN ('queued', 'downloading', 'importing', 'staged', 'paused', 'unavailable'))",
+                             (_now(), row['asin']))
+        return rows
 
     def update_download(
         self,
@@ -880,6 +1081,7 @@ class AudiobookDatabase:
         save_path: Optional[str] = None,
         error: Optional[str] = None,
         completeness: Optional[str] = None,
+        imported_path: Optional[str] = None,
     ) -> bool:
         """Patch whatever changed. Only the fields given are written.
 
@@ -892,7 +1094,7 @@ class AudiobookDatabase:
         for column, value in (
             ("status", status), ("progress", progress), ("bytes_done", bytes_done),
             ("bytes_total", bytes_total), ("save_path", save_path), ("error", error),
-            ("completeness", completeness),
+            ("completeness", completeness), ("imported_path", imported_path),
         ):
             if value is not None:
                 fields.append(f"{column} = ?")
@@ -905,7 +1107,7 @@ class AudiobookDatabase:
         conn = self._connect()
         try:
             cursor = conn.execute(
-                f"UPDATE audiobook_downloads SET {', '.join(fields)} WHERE download_id = ?",
+                f"UPDATE audiobook_downloads SET {', '.join(fields)} WHERE download_id = ?" + ("" if status == "cancelled" else " AND status != 'cancelled'"),
                 params,
             )
             conn.commit()
@@ -915,7 +1117,7 @@ class AudiobookDatabase:
             return False
 
     def add_to_library(self, book: Dict[str, Any], path: str, **extra: Any) -> bool:
-        """Record an imported book so the UI can say "you already have this"."""
+        """Record a downloaded or scanned book; local: keys identify unmatched files."""
         asin = str(book.get("asin") or "").strip()
         if not asin or not path:
             return False
@@ -927,8 +1129,9 @@ class AudiobookDatabase:
             conn.execute("""
                 INSERT OR REPLACE INTO audiobook_library
                     (asin, title, author, narrator, series_title, series_sequence,
-                     path, file_count, size_bytes, audio_format, runtime_minutes, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     path, file_count, size_bytes, audio_format, runtime_minutes, imported_at,
+                     cover_url, source, scan_signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 asin, str(book.get("title") or ""),
                 str(authors[0]) if authors else "",
@@ -937,23 +1140,92 @@ class AudiobookDatabase:
                 str(path), int(extra.get("file_count") or 0),
                 int(extra.get("size_bytes") or 0), str(extra.get("audio_format") or ""),
                 int(book.get("runtime_minutes") or 0), _now(),
+                str(book.get("cover_url") or ""), str(extra.get("source") or "download"),
+                str(extra.get("scan_signature") or ""),
             ))
+            catalog_asin = str(extra.get("catalog_asin") or (asin if not asin.startswith("local:") else ""))
+            conn.execute("""UPDATE audiobook_library SET catalog_asin=?, match_status=?,
+                origin=?, download_id=?, file_paths=?, file_scope=?, fingerprint=?, metadata_json=?, grouping=? WHERE asin=?""",
+                (catalog_asin, "identifier" if catalog_asin else "unmatched",
+                 extra.get("origin") or ("soulsync" if extra.get("download_id") else "disk" if extra.get("source") == "scan" else "unknown"),
+                 extra.get("download_id") or "", json.dumps(extra.get("file_paths") or []),
+                 extra.get("file_scope") or "folder", extra.get("fingerprint") or "",
+                 json.dumps(extra.get("metadata_json") or {}), extra.get("grouping") or "", asin))
             conn.commit()
             return True
         except sqlite3.Error as exc:
             logger.warning("Could not record %s in the audiobook library: %s", asin, exc)
             return False
 
+    @staticmethod
+    def _library_row(row) -> Dict[str, Any]:
+        data = dict(row)
+        for key, fallback in (("file_paths", []), ("match_candidates", []),
+                              ("match_evidence", []), ("metadata_json", {}), ("catalog_book", {})):
+            try:
+                data[key] = json.loads(data.get(key) or json.dumps(fallback))
+            except (ValueError, TypeError):
+                data[key] = fallback
+        return data
+
+    def cached_library_file(self, path: str, size: int, mtime: int):
+        row = self._connect().execute(
+            "SELECT payload FROM audiobook_library_file_cache WHERE path=? AND size=? AND mtime=?",
+            (path, size, mtime)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def cache_library_file(self, path: str, size: int, mtime: int, payload: dict):
+        conn = self._connect()
+        conn.execute("INSERT OR REPLACE INTO audiobook_library_file_cache VALUES (?, ?, ?, ?)",
+                     (path, size, mtime, json.dumps(payload)))
+        conn.commit()
+
+    def apply_library_match(self, key: str, *, signature: str, revision: int,
+                            status: str, catalog_asin: str = "", score: float = 0,
+                            evidence=None, candidates=None, book=None, manual=False) -> bool:
+        """Compare-and-set: a slow catalogue response cannot overwrite a newer decision."""
+        conn = self._connect()
+        guard = "" if manual else " AND match_status NOT IN ('confirmed', 'ignored', 'changed')"
+        cursor = conn.execute("""UPDATE audiobook_library SET catalog_asin=?, match_status=?,
+            match_score=?, match_evidence=?, match_candidates=?, catalog_book=?, match_checked_at=?,
+            match_revision=match_revision+1 WHERE asin=? AND scan_signature=? AND match_revision=?""" + guard,
+            (catalog_asin, status, score, json.dumps(evidence or []), json.dumps(candidates or []),
+             json.dumps(book or {}), _now(), key, signature, revision))
+        conn.commit()
+        return cursor.rowcount > 0
+
+    def library_download_history(self):
+        return {row["download_id"]: dict(row) for row in self._connect().execute("""
+            SELECT download_id, source, indexer, release_title, created_at, completed_at
+            FROM audiobook_downloads WHERE download_id IN
+            (SELECT download_id FROM audiobook_library WHERE download_id != '')""")}
+
+    def get_library_scan_state(self) -> Dict[str, Any]:
+        row = self._connect().execute(
+            "SELECT payload FROM audiobook_library_scan_state WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else {"status": "never"}
+
+    def set_library_scan_state(self, state: Dict[str, Any]) -> None:
+        conn = self._connect()
+        conn.execute("INSERT OR REPLACE INTO audiobook_library_scan_state (id, payload) VALUES (1, ?)",
+                     (json.dumps(state),))
+        conn.commit()
+
     def is_owned(self, asin: str) -> bool:
         conn = self._connect()
         row = conn.execute(
-            "SELECT 1 FROM audiobook_library WHERE asin = ?", (str(asin or "").strip(),),
+            "SELECT 1 FROM audiobook_library WHERE catalog_asin = ? AND match_status IN ('identifier', 'automatic', 'confirmed')", (str(asin or "").strip(),),
         ).fetchone()
         return row is not None
 
+    def get_library_entry(self, asin: str) -> Optional[Dict[str, Any]]:
+        row = self._connect().execute(
+            "SELECT * FROM audiobook_library WHERE asin = ?", (asin,)).fetchone()
+        return self._library_row(row) if row else None
+
     def get_library(self) -> List[Dict[str, Any]]:
         conn = self._connect()
-        return [dict(row) for row in conn.execute(
+        return [self._library_row(row) for row in conn.execute(
             "SELECT * FROM audiobook_library ORDER BY imported_at DESC")]
 
     def owned_asins(self) -> Set[str]:
@@ -964,8 +1236,8 @@ class AudiobookDatabase:
         """
         conn = self._connect()
         return {
-            str(row[0]) for row in conn.execute("SELECT asin FROM audiobook_library")
-            if row[0]
+            str(row[0]) for row in conn.execute("SELECT catalog_asin FROM audiobook_library WHERE match_status IN ('identifier', 'automatic', 'confirmed')")
+            if row[0] and not str(row[0]).startswith("local:")
         }
 
     def remove_from_library(self, asin: str) -> bool:
@@ -992,8 +1264,14 @@ class AudiobookDatabase:
     def update_library_entry(self, asin: str, **fields: Any) -> bool:
         """Refresh what the scan measured on disk: path, file count, size."""
         asin = str(asin or "").strip()
-        allowed = {"path", "file_count", "size_bytes", "audio_format"}
-        updates = {k: v for k, v in fields.items() if k in allowed}
+        allowed = {"path", "file_count", "size_bytes", "audio_format", "scan_signature",
+                   "title", "author", "narrator", "series_title", "series_sequence",
+                   "runtime_minutes", "cover_url", "catalog_asin", "match_status", "match_score",
+                   "match_candidates", "match_evidence", "catalog_book", "match_checked_at",
+                   "origin", "download_id", "file_paths", "file_scope", "fingerprint",
+                   "metadata_json", "grouping"}
+        updates = {k: json.dumps(v) if isinstance(v, (dict, list)) else v
+                   for k, v in fields.items() if k in allowed}
         if not asin or not updates:
             return False
         clause = ", ".join(f"{key} = ?" for key in updates)
@@ -1014,6 +1292,10 @@ class AudiobookDatabase:
         return {
             "id": row["id"],
             "asin": row["asin"],
+            # the row's owner. every status write used to default to profile 1
+            # because callers had no way to know whose row they held: a second
+            # profile's book was searched and grabbed on every pass, forever.
+            "profile_id": (row["profile_id"] if "profile_id" in row.keys() else 1),
             "title": row["title"],
             "subtitle": row["subtitle"],
             "authors": _json_load(row["authors"]),
@@ -1025,6 +1307,7 @@ class AudiobookDatabase:
             "release_date": row["release_date"],
             "language": row["language"],
             "status": row["status"],
+            "download_status": (row["download_status"] if "download_status" in row.keys() else None),
             # Older rows predate the column; "exact" is the safe reading of a
             # book wished for before the choice existed.
             "narrator_mode": (

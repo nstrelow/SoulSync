@@ -4,6 +4,7 @@ Hermetic: the slskd client is a stub in every test, nothing reaches the
 network, and no real config is read.
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -287,7 +288,7 @@ def test_an_empty_client_id_decodes_to_nothing():
 
 def test_the_landing_path_is_under_the_slskd_root():
     client = SimpleNamespace(download_path="/downloads")
-    assert landing_path("Book", client) == "/downloads/Book"
+    assert landing_path("Book", client) == os.path.join("/downloads", "Book")
 
 
 def test_no_folder_means_no_landing_path():
@@ -336,7 +337,7 @@ def test_a_folder_nothing_is_known_about_yet_is_queued():
 def test_files_slskd_has_forgotten_still_count_against_the_total():
     # Otherwise two finished files out of thirty would report the book done.
     rolled = aggregate([_status("a", "Completed, Succeeded")], expected=30)
-    assert rolled["state"] == "downloading"
+    assert rolled["state"] == "queued"
 
 
 def test_a_status_poll_only_counts_this_books_transfers():
@@ -350,7 +351,7 @@ def test_a_status_poll_only_counts_this_books_transfers():
     client.download_path = "/downloads"
     rolled = status_for(encode_refs(["mine-1"], "peer", "Book"), client=client)
     assert rolled["state"] == "done" and rolled["total"] == 1
-    assert rolled["save_path"] == "/downloads/Book"
+    assert rolled["save_path"] == os.path.join("/downloads", "Book")
 
 
 def test_an_unreachable_slskd_reports_nothing_rather_than_a_failure():
@@ -392,3 +393,58 @@ def test_a_cancel_that_stops_nothing_reports_false():
 
 def test_cancelling_a_row_with_no_refs_is_not_an_error():
     assert cancel("", client=MagicMock()) is False
+
+
+@pytest.mark.parametrize("state", ["Queued, Remotely", "Requested", "Initializing"])
+def test_non_transferring_files_do_not_claim_to_download(state):
+    assert aggregate([_status("a", state)])["state"] == "queued"
+
+
+def test_filename_refs_track_live_chapters_only_from_the_selected_peer():
+    client = MagicMock()
+    client.download_path = "/downloads"
+    def transfer(ref, filename, peer, state, size, done):
+        item = _status(ref, state, size, done)
+        item.filename = filename
+        item.username = peer
+        return item
+    async def everything():
+        return [
+            transfer("uuid-1", "Books/Book/01.mp3", "peer", "Completed, Succeeded", 100, 100),
+            transfer("uuid-2", "Books/Book/02.mp3", "peer", "InProgress", 100, 50),
+            transfer("uuid-3", "Books/Book/03.mp3", "peer", "Queued, Remotely", 100, 0),
+            transfer("other-peer", "Books/Book/02.mp3", "other", "InProgress", 900, 900),
+            transfer("other-folder", "Other/02.mp3", "peer", "InProgress", 900, 900),
+        ]
+    client.get_all_downloads = everything
+    refs = [r"Books\Book\01.mp3", r"Books\Book\02.mp3", r"Books\Book\03.mp3"]
+    result = status_for(encode_refs(refs, "peer", "Book"), client=client)
+    assert result["state"] == "downloading"
+    assert result["size"] == 300
+    assert result["transferred"] == 150
+    assert result["progress"] == 50
+    assert result["finished"] == 1
+    assert result["total"] == 3
+
+
+@pytest.mark.parametrize("unknown", [None, 0])
+def test_partial_chapter_durations_do_not_reject_a_complete_release(unknown):
+    from core.audiobook_release_search import rank_releases
+    album = _album()
+    for index, track in enumerate(album.tracks):
+        track.duration = 60 * 60 * 1000 if index < 2 else unknown
+    release = album_to_release(album, BOOK)
+    assert release.duration_seconds is None
+    assert rank_releases([release], BOOK, 0.0, "any") == [release]
+    assert release.duration_verdict != "severely_short"
+
+
+def test_all_known_short_chapter_durations_still_reject_incomplete_release():
+    from core.audiobook_release_search import rank_releases
+    album = _album()
+    for track in album.tracks:
+        track.duration = 10 * 60 * 1000
+    release = album_to_release(album, BOOK)
+    assert release.duration_seconds == 60 * 60
+    assert rank_releases([release], BOOK, 0.0, "any") == []
+    assert release.duration_verdict == "severely_short"

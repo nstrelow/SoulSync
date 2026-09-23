@@ -247,16 +247,21 @@ def _read(rel):
 
 
 def test_the_library_is_reachable_from_the_audiobooks_page():
+    # a link to its own page now, not a modal: the library has a url that
+    # can be linked, reloaded and sent
     page = _read("webui/src/routes/audiobooks/-ui/audiobooks-page.tsx")
-    assert "AudiobookLibraryModal" in page
-    assert "setShowLibrary" in page
+    assert 'to="/audiobooks/library"' in page
+    route = _read("webui/src/routes/audiobooks/library.tsx")
+    assert "createFileRoute('/audiobooks/library')" in route
+    assert "AudiobookLibraryPanel" in route
 
 
 def test_deleting_a_book_says_it_is_recoverable():
     # A destructive action that does not say it can be undone reads as final.
     modal = _read("webui/src/routes/audiobooks/-ui/audiobook-library-modal.tsx")
-    assert "recycle bin first" in modal
-    assert "window.showConfirmDialog" in modal
+    assert "recycle bin settings apply" in modal
+    assert "Confirm delete" in modal
+    assert "Keep book" in modal
     assert "window.confirm" not in modal
 
 
@@ -458,3 +463,20 @@ def test_erasing_for_good_asks_first():
     modal = _read("webui/src/routes/audiobooks/-ui/audiobook-review-modal.tsx")
     assert "cannot be undone" in modal
     assert "window.showConfirmDialog" in modal
+
+
+def test_a_loose_book_file_can_be_recycled_and_restored(library):
+    file = library / 'Book.m4b'
+    file.write_bytes(b'book audio')
+    result = discard(str(file))
+    assert result['ok'] and not file.exists()
+    restored = restore(Path(result['moved_to']).name)
+    assert restored['ok'] and file.read_bytes() == b'book audio'
+
+
+def test_a_loose_book_file_can_be_deleted_with_recycling_disabled(library):
+    file = library / 'Book.m4b'
+    file.write_bytes(b'book audio')
+    with patch('core.audiobook_recycle.recycling_enabled', return_value=False):
+        result = discard(str(file))
+    assert result['ok'] and result['permanent'] and not file.exists()

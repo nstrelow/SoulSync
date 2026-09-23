@@ -31,6 +31,14 @@ _COMPLETE_STATES = {"seeding", "completed", "complete", "succeeded", "finished"}
 
 DEFAULT_POLL_SECONDS = 20.0
 
+# consecutive ticks a job may be unknown to a REACHABLE client before the
+# book is failed and handed back to the wishlist. the video monitor's rule
+# (_GIVE_UP_AFTER). without it a torrent deleted from the client sat on
+# "waiting for client" forever, and the wishlist row behind it stayed
+# "grabbed" forever because a live-looking download blocked the reset.
+GIVE_UP_AFTER_MISSES = 8
+_misses: Dict[str, int] = {}
+
 
 def normalize_state(status: Any) -> str:
     """Collapse a client's own vocabulary into downloading / completed / failed.
@@ -76,7 +84,7 @@ def process_download(
 
     status = get_status(source, ref)
     if status is None:
-        return {}
+        return {"status": "unavailable", "error": "Waiting for the download client to report this job"}
 
     patch: Dict[str, Any] = {}
     for key, attr in (("bytes_done", "downloaded"), ("bytes_total", "size")):
@@ -96,6 +104,10 @@ def process_download(
         except (TypeError, ValueError):
             pass
 
+    speed = getattr(status, "download_speed", None)
+    if speed is not None:
+        patch["speed"] = max(0, float(speed or 0))
+
     state = normalize_state(status)
     if state == "failed":
         patch["status"] = "failed"
@@ -103,7 +115,14 @@ def process_download(
         return patch
 
     if state != "completed":
-        patch["status"] = "downloading"
+        raw_state = str(getattr(status, "state", "")).lower()
+        if raw_state in ("queued", "waiting", "stalled", "missing"):
+            patch["status"] = "queued"
+        elif raw_state in ("paused", "unavailable"):
+            patch["status"] = raw_state
+        else:
+            patch["status"] = "downloading"
+        patch["error"] = "Waiting for the download client to report this job" if raw_state == "unavailable" else ""
         return patch
 
     # content_path FIRST. It is the client's absolute path to THIS torrent's
@@ -179,11 +198,11 @@ class _SoulseekStatus:
     """
 
     def __init__(self, rolled: Dict[str, Any]) -> None:
-        self.state = rolled["state"]
-        self.progress = rolled["progress"]
+        self.state = "completed" if rolled["state"] == "done" else rolled["state"]
+        self.progress = rolled["progress"] / 100.0
         self.size = rolled["size"]
-        self.transferred = rolled["transferred"]
-        self.speed = 0
+        self.downloaded = rolled["transferred"]
+        self.download_speed = rolled.get("speed", 0)
         self.save_path = rolled.get("save_path", "")
         self.files = rolled["total"]
         self.files_done = rolled["finished"]
@@ -208,6 +227,28 @@ def _get_status(source: str, ref: str) -> Any:
     except Exception:                                       # noqa: BLE001
         logger.debug("Audiobook status poll failed for %s %s", source, ref, exc_info=True)
         return None
+
+
+def _client_reachable(source: str) -> bool:
+    """whether the client carrying `source` jobs can be asked at all.
+
+    a job the client does not know is a different thing from a client that
+    is down: the first will never come back, the second will. only the
+    first should count towards giving up."""
+    try:
+        if source == "soulseek":
+            from core.audiobook_soulseek import _shared_client
+            return _shared_client() is not None
+        if source == "torrent":
+            from core.torrent_clients import get_active_adapter
+        else:
+            from core.usenet_clients import get_active_adapter
+        adapter = get_active_adapter()
+        if adapter is None:
+            return False
+        return bool(_run(adapter.check_connection()))
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def _resolve_path(reported: Any) -> Any:
@@ -351,20 +392,36 @@ def tick(db: Any = None) -> Dict[str, int]:
 
     from core.audiobook_download_state import (
         forget,
+        register_download,
         is_cancelled,
         mark_status,
+        set_task_metadata,
         update_progress,
     )
 
     for row in active:
         summary["checked"] += 1
+        source = str(row.get("source") or "").lower()
+        username = ""
+        release_title = str(row.get("release_title") or "")
+        if source == "soulseek":
+            from core.audiobook_soulseek import decode_refs
+            unpacked = decode_refs(row.get("client_id"))
+            username = unpacked.get("username") or ""
+            if not release_title:
+                release_title = unpacked.get("folder") or ""
+        # Runtime cards disappear on restart; the durable job and client refs
+        # remain. Reattach without replacing existing progress/cancellation.
+        register_download(row["download_id"], row.get("title") or "Audiobook",
+                          author=row.get("author") or "", protocol=row.get("source") or "",
+                          size_bytes=row.get("bytes_total") or 0, only_if_missing=True,
+                          username=username, release_title=release_title)
+        set_task_metadata(row["download_id"], username=username, release_title=release_title)
 
         # Cancelling a card used to remove it from the page while the torrent
-        # carried on downloading. The client is told, then the row is closed.
+        # carried on downloading. Persist cancellation before runtime cleanup.
         if is_cancelled(row["download_id"]):
-            _cancel_at_client(row)
-            database.update_download(row["download_id"], status="cancelled",
-                                     error="Cancelled")
+            cancel_downloads([row["download_id"]], db=database)
             forget(row["download_id"])
             summary["cancelled"] += 1
             continue
@@ -376,7 +433,10 @@ def tick(db: Any = None) -> Dict[str, int]:
             continue
 
         imported_path = patch.pop("imported_path", "")
-        database.update_download(row["download_id"], **patch)
+        speed = patch.pop("speed", None)
+        if not database.update_download(row["download_id"], imported_path=imported_path or None, **patch):
+            forget(row["download_id"])
+            continue
 
         # Same numbers onto the Downloads page card.
         update_progress(
@@ -384,39 +444,74 @@ def tick(db: Any = None) -> Dict[str, int]:
             percent=patch.get("progress"),
             bytes_done=patch.get("bytes_done"),
             bytes_total=patch.get("bytes_total"),
+            speed=speed,
         )
+
+        if patch.get("status") == "unavailable":
+            # unknown to the client. counted only when the client is there to
+            # ask, so a client that is down keeps every book waiting instead
+            # of failing them all.
+            if _client_reachable(str(row.get("source") or "")):
+                misses = _misses.get(row["download_id"], 0) + 1
+                _misses[row["download_id"]] = misses
+                if misses >= GIVE_UP_AFTER_MISSES:
+                    _misses.pop(row["download_id"], None)
+                    patch = {
+                        "status": "failed",
+                        "error": "The download client no longer has this job; the book goes back to the wishlist",
+                    }
+                    database.update_download(row["download_id"], **patch)
+        else:
+            _misses.pop(row["download_id"], None)
+        if patch.get("status") in ("downloading", "queued", "paused", "unavailable"):
+            mark_status(row["download_id"], "downloading" if patch["status"] == "downloading" else "queued",
+                        error=patch.get("error") or ("Paused in download client" if patch["status"] == "paused" else ""),
+                        release_title=release_title)
 
         asin = str(row.get("asin") or "")
         if patch.get("status") == "completed":
-            mark_status(row["download_id"], "completed", file_path=imported_path)
+            mark_status(row["download_id"], "completed", file_path=imported_path, release_title=release_title)
             # The card has served its purpose; the history lives in the
             # audiobook database, not in runtime state.
             forget(row["download_id"])
             summary["completed"] += 1
             if asin:
-                database.mark_wishlist_status(asin, STATUS_DONE)
+                # every profile's row: the library is shared, so the book is
+                # done for whoever wanted it, not only profile 1
+                database.mark_wishlist_status(asin, STATUS_DONE, profile_id=None)
                 database.add_to_library(
                     _book_for(row), imported_path or patch.get("save_path", ""),
+                    download_id=row["download_id"], origin="soulsync",
                 )
             logger.info("Audiobook imported: %s -> %s", row.get("title"), imported_path)
         elif patch.get("status") == "staged":
             # "importing" on the card, and deliberately NOT an error: the book is
             # waiting for the rest of itself, which is a normal state a torrent
-            # passes through. Putting the reason in error_message would paint it
-            # red on the shared Downloads page as though something had gone
-            # wrong. The reason lives in the audiobook database, where the
-            # audiobook UI can show it as what it is.
+            # passes through.
             summary["staged"] += 1
-            mark_status(row["download_id"], "importing")
+            held_msg = str(patch.get("completeness") or "Completeness check held import")
+            mark_status(row["download_id"], "importing", held_reason=held_msg, release_title=release_title)
         elif patch.get("status") == "failed":
-            mark_status(row["download_id"], "failed", error=str(patch.get("error") or ""))
+            mark_status(row["download_id"], "failed", error=str(patch.get("error") or ""), release_title=release_title)
             summary["failed"] += 1
             _return_to_wishlist(database, row, str(patch.get("error") or ""))
             if asin:
                 database.mark_wishlist_status(
-                    asin, STATUS_FAILED, error=str(patch.get("error") or ""),
+                    asin, STATUS_FAILED, profile_id=None,
+                    error=str(patch.get("error") or ""),
                 )
     return summary
+
+
+def cancel_downloads(task_ids=None, db=None):
+    from core.audiobook_database import get_audiobook_db
+    from core.audiobook_download_state import forget
+    database = db if db is not None else get_audiobook_db()
+    rows = database.cancel_active_downloads(task_ids)
+    for row in rows:
+        _cancel_at_client(row)
+        forget(row['download_id'])
+    return len(rows)
 
 
 def _cancel_at_client(row: Dict[str, Any]) -> None:
@@ -486,8 +581,9 @@ def _return_to_wishlist(database: Any, row: Dict[str, Any], error: str) -> None:
         logger.debug("Could not block the failed release: %s", exc)
 
     try:
-        if database.is_wishlisted(asin):
-            database.mark_wishlist_status(asin, STATUS_FAILED, error=error)
+        # whoever wanted it. checking profile 1 alone meant another profile's
+        # failed grab re-added the book to profile 1's list instead
+        if database.mark_wishlist_status(asin, STATUS_FAILED, profile_id=None, error=error):
             return
         book = _book_for(row)
         if book.get("title") and database.add_to_wishlist(book):

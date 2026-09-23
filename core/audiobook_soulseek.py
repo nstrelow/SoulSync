@@ -70,6 +70,18 @@ def is_enabled() -> bool:
         return False
 
 
+def _shared_client():
+    """The process-wide Soulseek client.
+
+    Deliberately NOT cached here, and deliberately reading no config here: the
+    audiobook side must never consult music's soulseek settings to decide
+    anything (tests/test_audiobooks_isolation.py holds that line). The cache and
+    the config read both live in core/soulseek_client.py, which owns them.
+    """
+    from core.soulseek_client import get_shared_soulseek_client
+    return get_shared_soulseek_client()
+
+
 def is_available() -> bool:
     """Whether Soulseek can actually answer: wanted by the chain AND configured.
 
@@ -80,15 +92,14 @@ def is_available() -> bool:
     if not is_enabled():
         return False
     try:
-        from core.soulseek_client import SoulseekClient
-        return bool(str(getattr(SoulseekClient(), "base_url", "") or ""))
+        return bool(str(getattr(_shared_client(), "base_url", "") or ""))
     except Exception as exc:                                # noqa: BLE001
         logger.debug("Could not check whether slskd is configured: %s", exc)
         return False
 
 
 def audio_files(album: Any) -> List[Dict[str, Any]]:
-    """Every audio file in a folder result, as ``{filename, size}``.
+    """Every audio file in a folder result, as ``{filename, size, duration}``.
 
     Non-audio is dropped here rather than downloaded and deleted: peers share
     scans, playlists and stray archives alongside the audio, and none of it
@@ -99,7 +110,13 @@ def audio_files(album: Any) -> List[Dict[str, Any]]:
         name = str(getattr(track, "filename", "") or "")
         if not name or not name.lower().endswith(_AUDIO_SUFFIXES):
             continue
-        files.append({"filename": name, "size": int(getattr(track, "size", 0) or 0)})
+        duration_ms = getattr(track, "duration", None)
+        duration_sec = (float(duration_ms) / 1000.0) if duration_ms is not None else None
+        files.append({
+            "filename": name,
+            "size": int(getattr(track, "size", 0) or 0),
+            "duration": duration_sec,
+        })
     return files
 
 
@@ -151,6 +168,13 @@ def album_to_release(album: Any, book: Dict[str, Any]) -> Optional[Any]:
     # unabridged marker the same way a torrent name does.
     name = folder_name(album)
     size = sum(int(entry.get("size") or 0) for entry in files)
+    durations = [entry["duration"] for entry in files if entry.get("duration") is not None]
+    # Missing/zero chapter lengths are unknown, not silence. A partial sum is
+    # not a release runtime and must not drive the ranker's hard shortness gate.
+    total_duration_sec = (
+        sum(durations) if len(durations) == len(files) and all(d > 0 for d in durations)
+        else None
+    )
 
     wanted_narrators = book.get("narrator_names") or book.get("narrators") or []
 
@@ -175,12 +199,14 @@ def album_to_release(album: Any, book: Dict[str, Any]) -> Optional[Any]:
         narrator_verdict=narrator_verdict(name, wanted_narrators),
         abridgement_verdict=abridgement_verdict(name, book.get("format_type")),
         language_verdict=language_verdict(name, book.get("language")),
+        duration_seconds=total_duration_sec,
         soulseek={
             "username": username,
             "album_path": album_path,
             "files": files,
             "file_count": len(files),
             "queue_length": int(getattr(album, "queue_length", 0) or 0),
+            "duration_seconds": total_duration_sec,
         },
     )
 
@@ -212,8 +238,7 @@ def search(
 
     if client is None:
         try:
-            from core.soulseek_client import SoulseekClient
-            client = SoulseekClient()
+            client = _shared_client()
         except Exception as exc:                            # noqa: BLE001
             logger.warning("Could not build a Soulseek client: %s", exc)
             return []
@@ -269,8 +294,7 @@ def grab(release: Any, save_path: Optional[str] = None, client: Any = None) -> D
 
     if client is None:
         try:
-            from core.soulseek_client import SoulseekClient
-            client = SoulseekClient()
+            client = _shared_client()
         except Exception as exc:                            # noqa: BLE001
             return {"ok": False, "error": f"Soulseek is not reachable: {exc}",
                     "refs": [], "username": username}
@@ -342,8 +366,7 @@ def landing_path(folder: str, client: Any = None) -> str:
         return ""
     try:
         if client is None:
-            from core.soulseek_client import SoulseekClient
-            client = SoulseekClient()
+            client = _shared_client()
         root = str(getattr(client, "download_path", "") or "")
     except Exception as exc:                                # noqa: BLE001
         logger.debug("Could not read the Soulseek download path: %s", exc)
@@ -404,8 +427,13 @@ def aggregate(statuses: Sequence[Any], expected: int = 0) -> Dict[str, Any]:
         state = "failed"
     elif settled >= expected:
         state = "done"
-    else:
+    elif any(_state_of(s) == "running" and any(
+        token in str(getattr(s, "state", "")).lower()
+        for token in ("inprogress", "downloading", "transferring")
+    ) for s in statuses):
         state = "downloading"
+    else:
+        state = "queued"
 
     progress = (transferred / total_size * 100.0) if total_size else (
         finished / expected * 100.0 if expected else 0.0
@@ -415,6 +443,7 @@ def aggregate(statuses: Sequence[Any], expected: int = 0) -> Dict[str, Any]:
         "state": state,
         "progress": round(min(progress, 100.0), 2),
         "transferred": transferred,
+        "speed": sum(max(0, float(getattr(s, "speed", 0) or 0)) for s in statuses if _state_of(s) not in ("done", "failed")),
         "size": total_size,
         "finished": finished,
         "failed": failed,
@@ -432,8 +461,7 @@ def status_for(client_id: Any, client: Any = None) -> Optional[Dict[str, Any]]:
 
     if client is None:
         try:
-            from core.soulseek_client import SoulseekClient
-            client = SoulseekClient()
+            client = _shared_client()
         except Exception as exc:                            # noqa: BLE001
             logger.debug("Could not build a Soulseek client to poll: %s", exc)
             return None
@@ -446,9 +474,21 @@ def status_for(client_id: Any, client: Any = None) -> Optional[Dict[str, Any]]:
         logger.debug("Soulseek status poll failed: %s", exc)
         return None
 
-    mine = [status for status in (everything or [])
-            if str(getattr(status, "id", "")) in wanted]
+    # slskd can acknowledge enqueue without returning a transfer ID. The
+    # shared client then returns the full remote filename. Match that fallback
+    # only within the submitting peer, never by basename or folder alone.
+    filenames = {ref.replace("\\", "/") for ref in wanted if "\\" in ref or "/" in ref}
+    peer = unpacked["username"]
+    mine = []
+    for status in everything or []:
+        transfer_id = str(getattr(status, "id", ""))
+        filename = str(getattr(status, "filename", "")).replace("\\", "/")
+        username = str(getattr(status, "username", ""))
+        if transfer_id in wanted or (peer and username == peer and filename in filenames):
+            mine.append(status)
     rolled = aggregate(mine, expected=len(wanted))
+    if not mine:
+        rolled["state"] = "unavailable"
     rolled["save_path"] = landing_path(unpacked["folder"], client)
     return rolled
 
@@ -461,8 +501,7 @@ def cancel(client_id: Any, client: Any = None) -> bool:
 
     if client is None:
         try:
-            from core.soulseek_client import SoulseekClient
-            client = SoulseekClient()
+            client = _shared_client()
         except Exception as exc:                            # noqa: BLE001
             logger.debug("Could not build a Soulseek client to cancel: %s", exc)
             return False

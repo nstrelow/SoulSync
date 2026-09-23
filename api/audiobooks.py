@@ -18,9 +18,11 @@ Endpoints:
 Acquisition (all scoped to the audiobook subsystem):
   - GET    /api/audiobooks/wishlist:          what is wanted, with counts and worker state.
   - POST   /api/audiobooks/wishlist:          want a book by ASIN.
+  - DELETE /api/audiobooks/wishlist:          clear the entire wishlist.
   - PATCH  /api/audiobooks/wishlist/<asin>:   change its narrator strictness.
   - DELETE /api/audiobooks/wishlist/<asin>:   stop wanting it.
   - POST   /api/audiobooks/wishlist/search:   run a wishlist pass now.
+  - POST   /api/audiobooks/wishlist/<asin>/search: search and grab one book now.
   - GET    /api/audiobooks/releases/<asin>:   what the indexers actually have.
   - POST   /api/audiobooks/grab:              send one release to the download client.
   - GET    /api/audiobooks/downloads:         what is downloading or has finished.
@@ -48,7 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, jsonify, request, send_file, url_for
 
 from core.audiobook_client import (
     SEARCH_TYPES,
@@ -68,6 +70,26 @@ logger = get_logger("audiobooks.api")
 
 _MAX_LIMIT = 50   # Audible 400s above this; clamped rather than forwarded
 _DEFAULT_LIMIT = 25
+
+
+def _library_cover(row):
+    """Only serve known image names inside the configured, indexed book folder."""
+    from pathlib import Path
+    from core.audiobook_organizer import library_root
+    try:
+        root = Path(library_root()).resolve()
+        path = Path(row.get("path") or "").resolve()
+        if path == root or not path.is_relative_to(root):
+            return None
+        candidates = [path / name for name in ("cover.jpg", "cover.jpeg", "cover.png", "cover.webp", "folder.jpg")]
+        if path.is_file():
+            candidates = [path.with_suffix(ext) for ext in (".jpg", ".png", ".webp")]
+        for candidate in candidates:
+            if candidate.is_file() and candidate.resolve().is_relative_to(root):
+                return candidate.resolve()
+    except OSError:
+        pass
+    return None
 
 
 def _limit(default: int = _DEFAULT_LIMIT) -> int:
@@ -576,6 +598,18 @@ def create_audiobooks_blueprint() -> Blueprint:
         choice must not reset the book's retry backoff.
         """
         body = request.get_json(silent=True) or {}
+
+        # "look again": the way back from cancelled (never retried on its
+        # own) and past the backoff on failed, keeping the narrator choice.
+        if str(body.get("status") or "").strip().lower() == "wanted":
+            changed = get_audiobook_db().retry_wishlist_entry(asin, _profile())
+            if not changed:
+                return jsonify({
+                    "success": False,
+                    "error": f"{asin} is not on the wishlist, or is not in a state that can be retried",
+                }), 404
+            return jsonify({"success": True, "status": "wanted"})
+
         narrator_mode = str(body.get("narrator_mode") or "").strip().lower()
         if narrator_mode not in ("exact", "any"):
             return jsonify({
@@ -586,6 +620,12 @@ def create_audiobooks_blueprint() -> Blueprint:
         if not changed:
             return jsonify({"success": False, "error": f"{asin} is not on the wishlist"}), 404
         return jsonify({"success": True, "narrator_mode": narrator_mode})
+
+    @bp.route("/wishlist", methods=["DELETE"])
+    def wishlist_clear():
+        """Clear all books from the wishlist for this profile."""
+        cleared = get_audiobook_db().clear_wishlist(_profile())
+        return jsonify({"success": True, "cleared": cleared, "wishlisted": False})
 
     @bp.route("/wishlist/<asin>", methods=["DELETE"])
     def wishlist_remove(asin: str):
@@ -598,9 +638,9 @@ def create_audiobooks_blueprint() -> Blueprint:
         """Run a wishlist pass right now.
 
         The same code path the background worker runs, so the manual button and
-        the timer cannot drift apart. It still honours each book's own backoff —
-        pressing it repeatedly does not re-search anything recently tried, which
-        is what stops it becoming a way to hammer the indexers by hand.
+        the timer cannot drift apart. By default, manual searches pass force=True
+        (due_only=False) to ensure items are checked even if within the 6-hour
+        retry backoff.
         """
         from core.audiobook_wishlist_worker import run_pass
 
@@ -609,12 +649,34 @@ def create_audiobooks_blueprint() -> Blueprint:
         if denied is not None:
             return denied
 
+        body = request.get_json(silent=True) or {}
+        # If "force" is explicitly specified as False, honour backoff; otherwise default manual search to force=True
+        force = bool(body.get("force", True))
+
         try:
-            summary = run_pass()
+            summary = run_pass(due_only=not force)
         except Exception as exc:                            # noqa: BLE001
             logger.warning("Manual audiobook wishlist pass failed: %s", exc, exc_info=True)
             return jsonify({"success": False, "error": str(exc)}), 500
         return jsonify({"success": True, "summary": summary})
+
+    @bp.route("/wishlist/<asin>/search", methods=["POST"])
+    def wishlist_search_book(asin: str):
+        """Search and attempt to grab one specific wishlisted book immediately."""
+        from core.audiobook_wishlist_worker import search_single_book
+
+        denied = _download_denied()
+        if denied is not None:
+            return denied
+
+        try:
+            res = search_single_book(asin, profile_id=_profile())
+            if not res.get("ok"):
+                return jsonify({"success": False, "error": res.get("error", "Search failed")}), 404
+            return jsonify({"success": True, "outcome": res.get("outcome")})
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning("Targeted search for %s failed: %s", asin, exc, exc_info=True)
+            return jsonify({"success": False, "error": str(exc)}), 500
 
     # ------------------------------------------------------------------
     # Watchlist — followed authors
@@ -816,31 +878,139 @@ def create_audiobooks_blueprint() -> Blueprint:
 
     @bp.route("/library", methods=["GET"])
     def library():
-        """Everything imported, newest first."""
-        rows = get_audiobook_db().get_library()
+        """Indexed local books and the most recent folder scan."""
+        from core.audiobook_library_scan import scan_status
+        from core.audiobook_organizer import library_root
+
+        db = get_audiobook_db()
+        rows = db.get_library()
+        history = db.library_download_history()
+        for row in rows:
+            row["download"] = history.get(row.get("download_id"))
+            matched_cover = (row.get("catalog_book") or {}).get("cover_url")
+            if matched_cover and not row.get("cover_url"):
+                row["cover_url"] = matched_cover
+            if not row.get("cover_url"):
+                row["cover_url"] = url_for("audiobooks_api.library_cover", asin=row["asin"])
         return jsonify({
-            "success": True,
-            "books": rows,
+            "success": True, "books": rows,
             "total_bytes": sum(int(r.get("size_bytes") or 0) for r in rows),
+            "root": library_root(), "scan": scan_status(db),
         })
+
+    @bp.route("/library/<asin>/matches", methods=["GET"])
+    def library_matches(asin: str):
+        from core.audiobook_library_matching import candidates_for, score_candidate
+        from core.audiobook_library_metadata import ASIN_RE
+        row = get_audiobook_db().get_library_entry(asin)
+        if row is None:
+            return jsonify({"success": False, "error": "Book not found"}), 404
+        query = str(request.args.get("q") or "").strip()[:300]
+        try:
+            client = get_audiobook_client()
+            if ASIN_RE.fullmatch(query):
+                book = client.get_book(query.upper())
+                candidates = [score_candidate(row.get("metadata_json") or row, book)] if book else []
+            else:
+                candidates = candidates_for(row, client, query=query or None)
+            return jsonify({"success": True, "candidates": candidates,
+                            "scan_signature": row.get("scan_signature", ""),
+                            "match_revision": row.get("match_revision", 0)})
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 503
+
+    @bp.route("/library/<asin>/match", methods=["PATCH"])
+    def library_match(asin: str):
+        from core.audiobook_library_matching import compact
+        from core.audiobook_library_metadata import ASIN_RE
+        db = get_audiobook_db()
+        row = db.get_library_entry(asin)
+        if row is None:
+            return jsonify({"success": False, "error": "Book not found"}), 404
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "Invalid match request"}), 400
+        action = data.get("action")
+        if action not in ("confirm", "ignore", "retry"):
+            return jsonify({"success": False, "error": "Choose confirm, ignore or retry"}), 400
+        if data.get("scan_signature") != row.get("scan_signature") or data.get("match_revision") != row.get("match_revision"):
+            return jsonify({"success": False, "error": "This book changed. Refresh its matches before saving."}), 409
+        selected = str(data.get("catalog_asin") or "").strip().upper()
+        book = {}
+        if action == "confirm":
+            if not ASIN_RE.fullmatch(selected):
+                return jsonify({"success": False, "error": "A valid Audible ASIN is required"}), 400
+            try:
+                result = get_audiobook_client().get_book(selected)
+            except Exception:
+                result = None
+            if result is None:
+                return jsonify({"success": False, "error": "Could not verify that catalogue edition. Try again later."}), 503
+            book = compact(result)
+            if book.get("asin") != selected or book.get("source") not in (None, "audible"):
+                return jsonify({"success": False, "error": "The catalogue returned a different edition"}), 400
+        ok = db.apply_library_match(asin, signature=data["scan_signature"], revision=data["match_revision"],
+            status="confirmed" if action == "confirm" else "ignored" if action == "ignore" else "unmatched",
+            catalog_asin=selected if action == "confirm" else "", book=book, manual=True,
+            evidence=["Edition confirmed by you" if action == "confirm" else "Kept unmatched by you" if action == "ignore" else "Automatic matching requested"])
+        if not ok:
+            return jsonify({"success": False, "error": "The book changed while saving. Refresh and try again."}), 409
+        if action == "retry":
+            db.update_library_entry(asin, match_checked_at=0)
+        return jsonify({"success": True, "book": db.get_library_entry(asin)})
+
+    @bp.route("/library/<asin>/cover", methods=["GET"])
+    def library_cover(asin: str):
+        row = get_audiobook_db().get_library_entry(asin)
+        cover = _library_cover(row) if row else None
+        if cover is not None:
+            return send_file(cover, conditional=True, max_age=3600)
+        if row:
+            from io import BytesIO
+            from pathlib import Path
+            from core.audiobook_organizer import library_root
+            from core.audiobook_library_metadata import embedded_cover
+            root = Path(library_root()).resolve()
+            path = Path(row.get("path") or "").resolve()
+            if path != root and path.is_relative_to(root):
+                art = embedded_cover(path)
+                if art:
+                    return send_file(BytesIO(art[0]), mimetype=art[1], max_age=3600)
+        return jsonify({"success": False, "error": "No local cover"}), 404
 
     @bp.route("/library/<asin>", methods=["DELETE"])
     def library_delete(asin: str):
         """Remove one book from disk and from the record.
 
         The folder goes to the recycle bin rather than being unlinked, so a
-        mistake is recoverable for as long as the keep window allows. The row
-        is dropped either way: leaving it would put an Owned badge on a book
-        that is no longer there.
+        mistake is recoverable for as long as the keep window allows. Ownership
+        is removed only after the disk operation succeeds.
         """
         db = get_audiobook_db()
-        row = next((r for r in db.get_library() if r.get("asin") == asin), None)
+        row = db.get_library_entry(asin)
         if row is None:
             return jsonify({"success": False, "error": "Not in your library"}), 404
 
         from core.audiobook_recycle import discard
 
-        outcome = discard(str(row.get("path") or ""), reason="deleted from the library")
+        from pathlib import Path
+        from core.audiobook_organizer import library_root
+        root = Path(library_root()).resolve()
+        path = Path(str(row.get("path") or "")).resolve()
+        if path == root or not path.is_relative_to(root):
+            return jsonify({"success": False, "error": "This book is outside the configured audiobook folder."}), 400
+        targets = [path]
+        if row.get("file_scope") == "files":
+            targets = [Path(p).resolve() for p in row.get("file_paths") or [str(path)]]
+            if any(p == root or not p.is_relative_to(root) or p.is_dir() for p in targets):
+                return jsonify({"success": False, "error": "The selected audio files are outside this library."}), 400
+        outcomes = []
+        for target in targets:
+            outcome = discard(str(target), reason="deleted from the library")
+            outcomes.append(outcome)
+            if not outcome.get("ok"):
+                return jsonify({"success": False, "error": (outcome.get("error") or "Could not delete this book.") + " Some files may already be in the recycle bin; scan to refresh."}), 400
+        outcome = {"ok": True, "permanent": any(o.get("permanent") for o in outcomes)}
         db.remove_from_library(asin)
         return jsonify({
             "success": True,
@@ -997,6 +1167,8 @@ def create_audiobooks_blueprint() -> Blueprint:
                 artwork_url=str(book.get("cover_url") or body.get("cover_url") or ""),
                 protocol=str(release.get("protocol") or ""),
                 size_bytes=int(release.get("size_bytes") or 0),
+                username=str(release.get("indexer") or "") if str(release.get("protocol") or "").lower() == "soulseek" else "",
+                release_title=str(release.get("title") or ""),
             )
             db.record_download(
                 download_id=ref,
@@ -1016,7 +1188,7 @@ def create_audiobooks_blueprint() -> Blueprint:
             from core.audiobook_database import STATUS_GRABBED
             # Only moves a row that already exists — grabbing something that was
             # never wishlisted must not silently add it.
-            db.mark_wishlist_status(asin, STATUS_GRABBED)
+            db.mark_wishlist_status(asin, STATUS_GRABBED, profile_id=_profile())
 
         # Something is now downloading, so start watching for it to finish even
         # if the monitor was asleep at boot.

@@ -13,6 +13,7 @@ from difflib import SequenceMatcher
 import requests
 from bs4 import BeautifulSoup
 from database.music_database import get_database, WatchlistArtist
+from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
 from core.spotify_client import SpotifyClient
 from core.metadata_service import (
     get_album_tracks_for_source,
@@ -20,6 +21,7 @@ from core.metadata_service import (
     get_primary_source,
     get_source_priority,
 )
+from core.metadata.artwork import usable_image_url
 from core.wishlist_service import get_wishlist_service
 from core.matching_engine import MusicMatchingEngine
 from utils.logging_config import get_logger
@@ -997,7 +999,9 @@ class WatchlistScanner:
                        deezer_artist_id, discogs_artist_id, musicbrainz_artist_id
                 FROM watchlist_artists
                 WHERE profile_id = ? AND (image_url IS NULL OR image_url = '' OR image_url = 'None'
-                      OR image_url NOT LIKE 'http%')
+                      OR image_url NOT LIKE 'http%'
+                      OR image_url LIKE '%/images/artist//%'
+                      OR image_url LIKE '%d41d8cd98f00b204e9800998ecf8427e%')
             """, (profile_id,))
             imageless = cursor.fetchall()
 
@@ -1018,7 +1022,7 @@ class WatchlistScanner:
                     LIMIT 1
                 """, (name,))
                 cr = cursor.fetchone()
-                if cr:
+                if cr and usable_image_url(cr['image_url']):
                     img = cr['image_url']
 
                 # 2. Deezer direct URL (no API call needed)
@@ -1284,12 +1288,72 @@ class WatchlistScanner:
             if source in {'spotify', 'itunes', 'deezer', 'discogs', 'musicbrainz'}
         ]
 
-        for provider in providers_to_backfill:
+        # The backfill is the longest phase of a scan for anyone who has just
+        # added artists, and it used to run silently with no way out: the page
+        # showed 0 of N for tens of minutes and Cancel did nothing, because the
+        # only cancel check was in the artist loop this runs before (#1240).
+        # It reports its own phase now, and it stops when asked.
+        backfill_cancelled = False
+        for provider_number, provider in enumerate(providers_to_backfill, 1):
+            # No cancel check out here on purpose. _backfill_missing_ids returns
+            # early without asking when a provider has nothing to match, and a
+            # pre-check here would consult the caller once per provider even
+            # then - work that does not exist cannot be worth cancelling, and
+            # asking anyway changes how often the check is called.
             try:
                 logger.info("Checking for missing %s IDs in watchlist...", provider)
-                self._backfill_missing_ids(watchlist_artists, provider)
+
+                def _backfill_progress(done, total, _p=provider, _n=provider_number):
+                    if scan_state is not None:
+                        scan_state.update({
+                            'current_phase': 'matching_sources',
+                            'matching_source': _p,
+                            'matching_source_number': _n,
+                            'matching_source_total': len(providers_to_backfill),
+                            'matching_artists_done': done,
+                            'matching_artists_total': total,
+                        })
+                    _emit(
+                        'matching_sources',
+                        profile_id=profile_id,
+                        source=_p,
+                        source_number=_n,
+                        source_total=len(providers_to_backfill),
+                        artists_done=done,
+                        artists_total=total,
+                    )
+
+                completed = self._backfill_missing_ids(
+                    watchlist_artists, provider,
+                    cancel_check=cancel_check,
+                    on_progress=_backfill_progress,
+                )
+                # ONLY an explicit False means "a cancel was honoured". A
+                # stub, a subclass or an older override that returns None is
+                # saying nothing, and reading that as a cancel would abort every
+                # scan before it started.
+                if completed is False:
+                    backfill_cancelled = True
+                    break
             except Exception as backfill_error:
                 logger.warning("Error during %s ID backfilling: %s", provider, backfill_error)
+
+        if backfill_cancelled:
+            logger.info("Watchlist scan cancelled during source matching")
+            if scan_state is not None:
+                scan_state.update({
+                    'status': 'cancelled',
+                    'current_phase': 'cancelled',
+                    'summary': {
+                        'total_artists': 0,
+                        'successful_scans': 0,
+                        'new_tracks_found': 0,
+                        'tracks_added_to_wishlist': 0,
+                        'cancelled': True,
+                    },
+                })
+            _emit('cancelled', processed=0, total=len(watchlist_artists))
+            return scan_results
 
         lookback_period = self._get_lookback_period_setting()
         is_full_discography = (lookback_period == 'all')
@@ -1335,6 +1399,12 @@ class WatchlistScanner:
 
             source_artist_id, source_provider = watchlist_source_identity(artist)
 
+            # "is this track missing" is asked of the artist's owner's library
+            # (#1199): a scheduled scan walks every profile's artists on one
+            # thread, and without this an own-library profile was answered
+            # from the shared library, so anything the admin had was never
+            # wishlisted for them
+            _scope_token = set_library_scope(library_scope_for_profile(getattr(artist, 'profile_id', None) or profile_id))
             try:
                 discography_result = self.get_artist_discography_for_watchlist(artist, artist.last_scan_timestamp)
                 if discography_result is None:
@@ -1401,7 +1471,19 @@ class WatchlistScanner:
                 artist_new_tracks = 0
                 artist_added_tracks = 0
 
+                artist_was_cancelled = False
                 for album_index, album in enumerate(albums):
+                    # The album loop had no cancel point at all, so a cancel
+                    # could only land between ARTISTS. An artist with thirty
+                    # albums is thirty fetches and thirty sleeps first, and a
+                    # slow provider makes that minutes of an unstoppable scan.
+                    if cancel_check and cancel_check():
+                        artist_was_cancelled = True
+                        logger.info(
+                            "Cancel received while checking albums for %s (%s of %s)",
+                            artist.artist_name, album_index, len(albums),
+                        )
+                        break
                     try:
                         album_data = album_fetcher(album.id, getattr(album, 'name', ''))
                         tracks = self._extract_track_items(album_data)
@@ -1547,6 +1629,12 @@ class WatchlistScanner:
                     tracks_added_to_wishlist=artist_added_tracks,
                 )
 
+                # a cancelled artist gets no discovery work and no pacing
+                # delay; the loop head handles the cancelled state properly
+                # on the next pass.
+                if artist_was_cancelled:
+                    continue
+
                 try:
                     if scan_state is not None:
                         scan_state['current_phase'] = 'fetching_similar_artists'
@@ -1587,6 +1675,8 @@ class WatchlistScanner:
                     profile_id=profile_id,
                     error_message=str(e),
                 )
+            finally:
+                reset_library_scope(_scope_token)
 
         if scan_state is not None:
             successful_scans = [r for r in scan_results if r.success]
@@ -1753,9 +1843,31 @@ class WatchlistScanner:
             logger.error(f"Error getting discography for artist {artist_id}: {e}")
             return None
 
-    def _backfill_missing_ids(self, artists: List[WatchlistArtist], provider: str):
+    def _backfill_missing_ids(
+        self,
+        artists: List[WatchlistArtist],
+        provider: str,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
         """
         Proactively match ALL artists missing IDs for the current provider.
+
+        Returns False when a cancel was honoured part way through, else True.
+
+        This runs BEFORE the artist loop and is usually the longest part of a
+        scan: one network lookup per artist per provider, with a sleep between
+        each. Somebody who has just added a few hundred artists has almost no
+        provider ids yet, so nearly every artist needs looking up against every
+        other provider - 379 artists over five providers is 1,895 lookups,
+        which is tens of minutes.
+
+        It used to run silently and ignore cancellation, so for all that time
+        the watchlist page sat on "0 / 379 artists" and the cancel button did
+        nothing - the only cancel check lived in the artist loop that had not
+        started yet. That is #1240: shows as scanning but never starts, and
+        cannot be cancelled.
         
         Example: User has 50 artists with only Spotify IDs.
         When iTunes becomes active, this matches ALL 50 to iTunes in one batch.
@@ -1771,13 +1883,13 @@ class WatchlistScanner:
 
         if not id_attr:
             logger.debug(f"Backfill not supported for provider: {provider}")
-            return
+            return True
 
         artists_to_match = [a for a in artists if not getattr(a, id_attr, None)]
 
         if not artists_to_match:
             logger.info(f"All artists already have {provider} IDs")
-            return
+            return True
 
         logger.info(f"Backfilling {len(artists_to_match)} artists with {provider} IDs...")
 
@@ -1799,11 +1911,25 @@ class WatchlistScanner:
 
         if not match_fn or not update_fn:
             logger.debug(f"No match/update function available for provider: {provider}")
-            return
+            return True
 
         matched_count = 0
         unmatched_names = []
-        for artist in artists_to_match:
+        total_to_match = len(artists_to_match)
+        for done, artist in enumerate(artists_to_match):
+            # checked BEFORE the lookup, so a cancel lands within one artist
+            # rather than after a whole provider pass
+            if cancel_check and cancel_check():
+                logger.info(
+                    "%s ID backfill cancelled after %s/%s artists",
+                    provider, done, total_to_match,
+                )
+                return False
+            if on_progress:
+                try:
+                    on_progress(done, total_to_match)
+                except Exception:                        # noqa: BLE001
+                    logger.debug("backfill progress callback failed", exc_info=True)
             try:
                 new_id = match_fn(artist.artist_name)
                 if new_id:
@@ -1821,10 +1947,16 @@ class WatchlistScanner:
                 unmatched_names.append(artist.artist_name)
                 continue
 
+        if on_progress:
+            try:
+                on_progress(total_to_match, total_to_match)
+            except Exception:                            # noqa: BLE001
+                logger.debug("backfill progress callback failed", exc_info=True)
         logger.info(f"Backfilled {matched_count}/{len(artists_to_match)} artists with {provider} IDs")
         if unmatched_names:
             logger.warning(f"Could not confidently match {len(unmatched_names)} artists: {', '.join(unmatched_names[:10])}"
                           f"{'...' if len(unmatched_names) > 10 else ''} — use Watchlist Settings to link manually")
+        return True
 
     @staticmethod
     def _normalize_artist_name(name: str) -> str:

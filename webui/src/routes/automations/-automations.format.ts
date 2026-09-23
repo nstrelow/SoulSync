@@ -114,6 +114,10 @@ const plural = (n: number, one: string, many = `${one}s`) =>
 type Sentence = (r: Record<string, unknown>) => string | null;
 
 const ACTION_SENTENCES: Record<string, Sentence> = {
+  audiobook_scan_library: (r) => {
+    if (typeof r.skipped === 'string') return r.skipped;
+    return `Scanned ${plural(num(r.checked), 'book')}, added ${num(r.adopted)}, refreshed ${num(r.updated)}, removed ${num(r.removed)} missing`;
+  },
   // artists_scanned / new_tracks_found / tracks_added_to_wishlist
   scan_watchlist: (r) => {
     const artists = num(r.artists_scanned);
@@ -235,6 +239,7 @@ const TRIGGER_LABELS: Record<string, string> = {
   watchlist_artist_added: 'Artist Watched',
   watchlist_artist_removed: 'Artist Unwatched',
   import_completed: 'Import Complete',
+  import_needs_attention: 'Import Needs Attention',
   mirrored_playlist_created: 'Playlist Mirrored',
   quality_scan_completed: 'Quality Scan Done',
   duplicate_scan_completed: 'Duplicate Scan Done',
@@ -278,6 +283,7 @@ const ACTION_LABELS: Record<string, string> = {
   process_wishlist: 'Process Wishlist',
   scan_watchlist: 'Scan Watchlist',
   scan_watchlist_podcasts: 'Scan Watchlist Podcasts',
+  audiobook_scan_library: 'Scan Audiobook Library',
   scan_library: 'Scan Library',
   refresh_mirrored: 'Refresh Mirrored',
   sync_playlist: 'Sync Playlist',
@@ -287,6 +293,7 @@ const ACTION_LABELS: Record<string, string> = {
   start_database_update_hourly: 'Update Database (Hourly)',
   run_duplicate_cleaner: 'Run Duplicate Cleaner',
   clear_quarantine: 'Clear Quarantine',
+  library_cleanup: 'Clear Quarantine + Empty Recycle Bin',
   cleanup_wishlist: 'Clean Up Wishlist',
   update_discovery_pool: 'Update Discovery',
   start_quality_scan: 'Run Quality Scan',
