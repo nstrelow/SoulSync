@@ -429,6 +429,10 @@ class MusicDatabase:
                 # writer waits politely instead of failing
                 connection.execute("PRAGMA busy_timeout = 30000")  # 30 second timeout
                 connection.execute("PRAGMA foreign_keys = ON")
+                # synchronous is per-connection, unlike journal_mode.
+                journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+                if journal_mode and str(journal_mode[0]).lower() == "wal":
+                    connection.execute("PRAGMA synchronous = NORMAL")
                 # NOT `PRAGMA journal_mode = WAL` here. wal mode is persistent in
                 # the file and is set once per process in _ensure_wal_mode; the
                 # pragma takes a lock, and on an install with enrichment
@@ -6254,42 +6258,19 @@ class MusicDatabase:
             logger.error(f"Error creating listening_history table: {e}")
 
     def insert_listening_events(self, events):
-        """Bulk insert listening events, skipping duplicates."""
-        if not events:
-            return 0
-        conn = None
+        """Insert server/player events through the same matcher as history imports."""
+        from core.listening_import.dedup import insert_import_events
+
+        grouped = {}
+        for event in events or []:
+            grouped.setdefault(event.get('server_source') or '', []).append(event)
         inserted = 0
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            for event in events:
-                try:
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO listening_history
-                            (track_id, title, artist, album, played_at, duration_ms, server_source, db_track_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        event.get('track_id'),
-                        event.get('title', ''),
-                        event.get('artist', ''),
-                        event.get('album', ''),
-                        event.get('played_at'),
-                        event.get('duration_ms', 0),
-                        event.get('server_source', ''),
-                        event.get('db_track_id'),
-                    ))
-                    if cursor.rowcount > 0:
-                        inserted += 1
-                except Exception as e:
-                    logger.debug("Failed to insert listening event: %s", e)
-            conn.commit()
-            return inserted
-        except Exception as e:
-            logger.error(f"Error inserting listening events: {e}")
-            return 0
-        finally:
-            if conn:
-                conn.close()
+        for source, batch in grouped.items():
+            try:
+                inserted += insert_import_events(self, batch, source)
+            except Exception as e:
+                logger.error(f"Error inserting listening events: {e}")
+        return inserted
 
     def record_web_player_play(self, event):
         """Record a single SoulSync web-player play: insert the listening_history
@@ -9614,17 +9595,22 @@ class MusicDatabase:
                             or jf_track_artist != jf_album_artist
                         ):
                             track_artist = jf_track_artist
-                # Navidrome/Subsonic: artist attribute is per-track
-                if not track_artist and hasattr(track_obj, 'artist') and isinstance(getattr(track_obj, 'artist', None), str):
-                    nav_artist = getattr(track_obj, 'artist', '').strip()
-                    # Compare against album artist name to only store when different
-                    try:
-                        artist_row = cursor.execute("SELECT name FROM artists WHERE id = ?", (artist_id,)).fetchone()
-                        album_artist_name = artist_row[0] if artist_row else ''
-                        if nav_artist and nav_artist.lower() != album_artist_name.lower():
-                            track_artist = nav_artist
-                    except Exception as e:
-                        logger.debug("Failed to load album artist for track_artist comparison: %s", e)
+                if not track_artist:
+                    raw_artist = ''
+                    for _payload_attr in ('_data', '_tags'):
+                        _payload = getattr(track_obj, _payload_attr, None)
+                        if isinstance(_payload, dict):
+                            raw_artist = (_payload.get('artist') or '').strip()
+                            if raw_artist:
+                                break
+                    if raw_artist:
+                        try:
+                            artist_row = cursor.execute("SELECT name FROM artists WHERE id = ?", (artist_id,)).fetchone()
+                            album_artist_name = (artist_row[0] or '') if artist_row else ''
+                            if raw_artist.lower() != album_artist_name.lower():
+                                track_artist = raw_artist
+                        except Exception as e:
+                            logger.debug("Failed to load album artist for track_artist comparison: %s", e)
 
                 # Extract MusicBrainz recording ID from server if available (Navidrome provides this)
                 mbid = getattr(track_obj, 'musicBrainzId', None) or None
@@ -14639,11 +14625,20 @@ class MusicDatabase:
         the current global profile for a new row. An explicitly UNKNOWN Quality
         Profile is rejected instead of quietly becoming the default (P2-04).
         """
+        from core.context_sentinels import is_context_sentinel
         from core.watchlist_sources import (
             ARTIST_ID_COLUMNS, artist_id_match_sql, infer_source,
             normalize_source, source_column,
         )
         try:
+            # a download-context placeholder is not an id. one reached this table
+            # once and the scanner keyed 25 similar artists by it (#1284).
+            if is_context_sentinel(artist_id):
+                logger.error(
+                    "Refusing to watchlist '%s': %r is a context placeholder, not an artist id",
+                    artist_name, artist_id)
+                return False
+
             if quality_profile_id is not None and not self.quality_profile_exists(quality_profile_id):
                 logger.error(
                     "Cannot add artist '%s' to watchlist: unknown quality_profile_id %r",
@@ -16044,6 +16039,14 @@ class MusicDatabase:
         'watchlist_row'). readers match the PAIR, so a deezer id can never
         resolve as an itunes one. omitting it leaves the row unprovable and
         the recommendation readers will not use it."""
+        from core.context_sentinels import is_context_sentinel
+        # the second line of defence for #1284: whatever put the placeholder in
+        # front of us, an edge keyed by one can never be traced back to an artist.
+        if is_context_sentinel(source_artist_id):
+            logger.warning(
+                "Refusing similar artists for %r: a context placeholder is not an artist id",
+                source_artist_id)
+            return False
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -16449,6 +16452,90 @@ class MusicDatabase:
             logger.debug(f"update_similar_artist_popularity failed: {e}")
             return 0
 
+    @staticmethod
+    def _temp_key_set(cursor, table: str, values) -> None:
+        """Materialise a small python set as a temp table the query can test against.
+
+        connections are per-operation (see _get_connection), so a TEMP table lives and
+        dies with this one call — no cleanup, no collision between threads."""
+        cursor.execute(f"CREATE TEMP TABLE {table} (v TEXT PRIMARY KEY)")  # noqa: S608 - table name is a literal
+        if values:
+            cursor.executemany(
+                f"INSERT OR IGNORE INTO {table} VALUES (?)",  # noqa: S608 - table name is a literal
+                [(v,) for v in values],
+            )
+
+    @staticmethod
+    def _watchlist_exclusion_keys(cursor, profile_id: int = 1) -> Dict[str, set]:
+        """The ids + names of this profile's watchlist artists, for exclusion.
+
+        a recommendation you already watch is not a recommendation. only truthy
+        values go in: an empty id column must never match another empty one."""
+        keys = {'spotify': set(), 'itunes': set(), 'deezer': set(), 'names': set()}
+        cursor.execute("""
+            SELECT artist_name, spotify_artist_id, itunes_artist_id, deezer_artist_id
+            FROM watchlist_artists WHERE profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            if row['spotify_artist_id']:
+                keys['spotify'].add(str(row['spotify_artist_id']))
+            if row['itunes_artist_id']:
+                keys['itunes'].add(str(row['itunes_artist_id']))
+            if row['deezer_artist_id']:
+                keys['deezer'].add(str(row['deezer_artist_id']))
+            if row['artist_name']:
+                keys['names'].add(str(row['artist_name']).lower())
+        return keys
+
+    def _deliberate_artist_source_ids(self, cursor, profile_id: int = 1) -> set:
+        """Every source_artist_id that stands for an artist this profile CHOSE.
+
+        that is: an artist in their library (owner NULL = the shared scope, or their
+        own rows) or on their watchlist. the watchlist scanner keys a row by the
+        watchlist row id when the artist has no provider id at all, so that key
+        counts too — the artist map's own query already coalesces to it."""
+        owned = set()
+        cursor.execute("""
+            SELECT spotify_artist_id, itunes_artist_id, deezer_id, musicbrainz_id
+            FROM artists WHERE +owner_profile_id IS NULL OR +owner_profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            owned.update(str(v) for v in tuple(row) if v)
+        cursor.execute("""
+            SELECT id, spotify_artist_id, itunes_artist_id, deezer_artist_id, musicbrainz_artist_id
+            FROM watchlist_artists WHERE profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            owned.update(str(v) for v in tuple(row) if v)
+        return owned
+
+    def _stray_similar_artist_sources(self, cursor, profile_id: int = 1) -> set:
+        """The source ids in similar_artists that trace back to nothing you chose.
+
+        the artist map caches a browse into this table under the browsed artist's id
+        (core/artists/map.py), and the download path has been seen writing under the
+        'from_sync_modal' placeholder. neither is a preference, so neither may seed
+        discovery. returned as the set to EXCLUDE because it is small — a few dozen
+        against the tens of thousands of ids a real library owns."""
+        cursor.execute(
+            "SELECT DISTINCT source_artist_id FROM similar_artists WHERE profile_id = ?",
+            (profile_id,))
+        present = {str(row[0]) for row in cursor.fetchall() if row[0] is not None}
+        if not present:
+            return set()
+        stray = present - self._deliberate_artist_source_ids(cursor, profile_id)
+        if stray and len(stray) == len(present):
+            # every stored edge is unattributable — discovery is about to go quiet, and
+            # a quiet feature gets reported as boring, never as broken. say so out loud.
+            logger.info(
+                "similar_artists: all %d source artists for profile %s resolve to no "
+                "library or watchlist artist — recommendations will be empty until one does",
+                len(present), profile_id)
+        elif stray:
+            logger.debug("similar_artists: ignoring %d of %d source artists (not library or watchlist)",
+                         len(stray), len(present))
+        return stray
+
     def get_top_similar_artists(
         self,
         limit: int = 50,
@@ -16458,6 +16545,12 @@ class MusicDatabase:
         adventurousness: float = None,
     ) -> List[SimilarArtist]:
         """Get top similar artists excluding watchlist artists, with cycling support.
+
+        Only edges whose SOURCE artist is one you chose count — an artist in your
+        library or on your watchlist. Opening the artist map caches rows here for
+        whoever you looked up, and a look-up is not a preference; see
+        _stray_similar_artist_sources.
+
         require_source: if set, only returns artists with that source ID.
         exclude_library_server: if set, also excludes artists already present in that media server.
         adventurousness: 0..1 dial. When given, the CANDIDATE SELECTION itself shifts with it — the
@@ -16533,6 +16626,25 @@ class MusicDatabase:
                         AVG(sa.similarity_rank) ASC"""
                     order_params = (_dial, _dial)
 
+                # only the artists you actually chose may seed a recommendation.
+                # browsing the artist map caches rows here too (core/artists/map.py),
+                # keyed by whoever you just looked up — curiosity, not intent. we drop
+                # the rows whose source artist is neither in your library nor on your
+                # watchlist. done by EXCLUSION: the strays are a handful, the owned ids
+                # are tens of thousands.
+                stray_sources = self._stray_similar_artist_sources(cursor, profile_id)
+                excl = self._watchlist_exclusion_keys(cursor, profile_id)
+
+                # the watchlist exclusion was a LEFT JOIN with four OR'd predicates and
+                # no index to serve any of them — every row of similar_artists scanned
+                # the whole watchlist (3.3s on a 101k-row table). the watchlist is tiny,
+                # so resolve it once in python and hand the query a set to test against.
+                self._temp_key_set(cursor, 'sa_stray_sources', stray_sources)
+                self._temp_key_set(cursor, 'sa_excl_names', excl['names'])
+                self._temp_key_set(cursor, 'sa_excl_spotify', excl['spotify'])
+                self._temp_key_set(cursor, 'sa_excl_itunes', excl['itunes'])
+                self._temp_key_set(cursor, 'sa_excl_deezer', excl['deezer'])
+
                 cursor.execute(f"""
                     SELECT
                         MAX(sa.id) as id,
@@ -16549,17 +16661,20 @@ class MusicDatabase:
                         MAX(sa.genres) as genres,
                         MAX(sa.popularity) as popularity
                     FROM similar_artists sa
-                    LEFT JOIN watchlist_artists wa ON (
-                        (sa.similar_artist_spotify_id IS NOT NULL AND sa.similar_artist_spotify_id = wa.spotify_artist_id)
-                        OR (sa.similar_artist_itunes_id IS NOT NULL AND sa.similar_artist_itunes_id = wa.itunes_artist_id)
-                        OR (sa.similar_artist_deezer_id IS NOT NULL AND sa.similar_artist_deezer_id = wa.deezer_artist_id)
-                        OR LOWER(sa.similar_artist_name) = LOWER(wa.artist_name)
-                    ) AND wa.profile_id = ?
-                    WHERE wa.id IS NULL AND sa.profile_id = ? {source_filter}
+                    WHERE sa.profile_id = ?
+                      AND sa.source_artist_id NOT IN (SELECT v FROM sa_stray_sources)
+                      AND LOWER(sa.similar_artist_name) NOT IN (SELECT v FROM sa_excl_names)
+                      AND (sa.similar_artist_spotify_id IS NULL
+                           OR sa.similar_artist_spotify_id NOT IN (SELECT v FROM sa_excl_spotify))
+                      AND (sa.similar_artist_itunes_id IS NULL
+                           OR sa.similar_artist_itunes_id NOT IN (SELECT v FROM sa_excl_itunes))
+                      AND (sa.similar_artist_deezer_id IS NULL
+                           OR sa.similar_artist_deezer_id NOT IN (SELECT v FROM sa_excl_deezer))
+                      {source_filter}
                     GROUP BY sa.similar_artist_name
                     {order_clause}
                     LIMIT ?
-                """, (profile_id, profile_id, *order_params, sql_limit))
+                """, (profile_id, *order_params, sql_limit))
 
                 rows = cursor.fetchall()
                 results = []
@@ -18184,6 +18299,42 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error batch updating tracks: {e}")
             return {'success': False, 'error': str(e)}
+
+    def clear_track_recording_mbid_if_matches(self, track_id, expected_mbid: str) -> bool:
+        """Null out ``tracks.musicbrainz_recording_id`` for ``track_id``, but ONLY when its
+        current value equals ``expected_mbid``.
+
+        Used by the mbid_mismatch repair fix (``RepairWorker._fix_mbid_mismatch``) right
+        after it strips that same bad MBID from the audio file's tag. The column is
+        populated verbatim from file tags at import (``core/imports/side_effects.py``),
+        and the export MBID waterfall's DB rung (``core/exports/export_sources.py``) reads
+        it directly — so clearing only the file tag would leave exports still resolving
+        the wrong recording out of the DB. The equality guard means a value something else
+        already corrected in the meantime (no longer the bad one) is left alone. Not part
+        of ``TRACK_EDITABLE_FIELDS``/``update_track_fields`` on purpose — this is a narrow,
+        repair-specific mutation, not a user-editable field.
+
+        Compares case-insensitively: ``side_effects.py`` lowercases the MBID before storing
+        it on import (``.strip().lower()``), but a repair finding's ``details['mbid']``
+        carries whatever case the file tag itself was written in — a plain ``=`` comparison
+        would silently match 0 rows for any tag that wasn't already lowercase.
+        """
+        if not expected_mbid or track_id is None:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE tracks SET musicbrainz_recording_id = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND LOWER(musicbrainz_recording_id) = LOWER(?)",
+                    (track_id, expected_mbid),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error clearing musicbrainz_recording_id for track {track_id}: {e}")
+            return False
 
     # ==================== Discovery Match Cache Methods ====================
 

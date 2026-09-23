@@ -358,8 +358,7 @@
                             <label><input type="checkbox" value="video-tools" checked> Tools</label>
                         </div>
                         <label class="profile-checkbox-label">
-                            <input type="checkbox" id="new-profile-can-download" checked> Can download (music, podcasts,
-                            audiobooks &amp; video)
+                            <input type="checkbox" id="new-profile-can-download" checked> Can download (music, podcasts, audiobooks &amp; video)
                         </label>
                     </div>
                     <button id="create-profile-btn" class="btn btn--block btn--primary profile-create-btn">Create
@@ -3971,12 +3970,19 @@
                                                     <input type="password" id="listenbrainz-token"
                                                         placeholder="ListenBrainz User Token">
                                                 </div>
+                                                <div class="form-group">
+                                                    <label>Username (optional):</label>
+                                                    <input type="text" id="listenbrainz-username"
+                                                        placeholder="Auto-detected from token if blank">
+                                                </div>
                                                 <div class="callback-info">
                                                     <div class="callback-help">Get your token from <a
                                                             href="https://listenbrainz.org/profile/" target="_blank"
                                                             style="color: #eb743b;">ListenBrainz Settings</a></div>
                                                     <div class="callback-help">Self-hosted? Enter your server URL (e.g.
                                                         http://localhost:8093)</div>
+                                                    <div class="callback-help">Maloja: use http://your-server:42010/apis/listenbrainz
+                                                        and your Maloja API key. Start history sync from Stats.</div>
                                                 </div>
                                                 <div class="form-group" style="margin-top: 12px;">
                                                     <label class="checkbox-label">
@@ -4972,8 +4978,7 @@
                                                         <div class="dlchain-col">
                                                             <div class="dlchain-col-head">
                                                                 <span class="dlchain-col-label">Available</span>
-                                                                <span class="dlchain-col-hint">drag one across, or click
-                                                                    it</span>
+                                                                <span class="dlchain-col-hint">drag one across, or click it</span>
                                                                 <input type="search" id="dlchain-filter"
                                                                     class="dlchain-filter" placeholder="Filter"
                                                                     aria-label="Filter available sources"
@@ -5146,6 +5151,25 @@
                                                     </select>
                                                     <small class="settings-hint">Skip peers with a queue longer than
                                                         this (prefers peers with shorter queues regardless)</small>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="checkbox-label">
+                                                        <input type="checkbox" id="soulseek-observed-speed-fallback-enabled">
+                                                        Retry slow Soulseek downloads
+                                                    </label>
+                                                    <small class="settings-hint">Off by default. Applies to automatic
+                                                        tracks and album bundles when another eligible peer is
+                                                        available; not manually chosen files.</small>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label>Minimum Observed Download Speed (KB/s):</label>
+                                                    <input type="number" id="soulseek-min-observed-download-speed"
+                                                        placeholder="250" min="0" step="50" value="250">
+                                                    <small class="settings-hint">When enabled, try the next Soulseek
+                                                        candidate after roughly one minute below this observed speed.
+                                                        Uses actual byte progress rather than the peer's advertised
+                                                        speed. The final available candidate is always allowed to
+                                                        continue. 0 also disables.</small>
                                                 </div>
                                                 <div class="form-group">
                                                     <label>Download Timeout (minutes):</label>
@@ -5552,8 +5576,7 @@
                                                         When YouTube downloads start failing with <strong>403
                                                             Forbidden</strong>, an out-of-date yt-dlp is nearly always
                                                         the cause.
-                                                        <strong>An update only takes effect after you restart
-                                                            SoulSync</strong> &mdash; the running process keeps using
+                                                        <strong>An update only takes effect after you restart SoulSync</strong> &mdash; the running process keeps using
                                                         the version it loaded at startup.
                                                     </div>
                                                     <div id="ytdlp-status"
@@ -6401,8 +6424,7 @@
                                                         <div class="setting-help-body" hidden>When a 24-bit or high
                                                             sample-rate FLAC is downloaded, it is automatically
                                                             converted to 16-bit/44.1kHz. The hi-res original is
-                                                            <strong>replaced</strong>, not kept alongside. Its acquired
-                                                            quality is remembered for upgrade decisions, preventing a
+                                                            <strong>replaced</strong>, not kept alongside. Its acquired quality is remembered for upgrade decisions, preventing a
                                                             download/downsample loop. Requires ffmpeg.</div>
                                                     </div>
                                                     <div class="form-group">
@@ -6566,8 +6588,7 @@
                                             </p>
                                             <div class="qp-editing-banner" id="qp-editing-banner" style="display:none">
                                                 Editing <strong class="qp-editing-banner-name">this profile</strong> —
-                                                not the active default. Changes autosave to this profile; Save Settings
-                                                saves it too.
+                                                not the active default. Changes autosave to this profile; Save Settings saves it too.
                                             </div>
                                             <div class="qp-profile-list" id="qp-profile-list">
                                                 <!-- rows injected by renderCustomQualityProfiles() -->
@@ -6861,8 +6882,7 @@
                                                     here) → post-processing
                                                     (tagging, artwork, organizing) → <strong>Music Library
                                                         Folder</strong> (their final home — point
-                                                    your media server here). Keeping the two separate stops
-                                                    half-finished files being scanned.
+                                                    your media server here). Keeping the two separate stops half-finished files being scanned.
                                                 </div>
                                                 <!-- One of these shows, picked by the detected deployment (settings.js
                                      reads _environment.docker); both render until detection lands. -->
@@ -7061,8 +7081,7 @@
                                                 <h3>Additional Music Libraries</h3>
 
                                                 <div class="help-text" style="margin-bottom: 12px;">
-                                                    Your Music Library Folder above is already covered — <strong>you
-                                                        don't need to repeat it here.</strong>
+                                                    Your Music Library Folder above is already covered — <strong>you don't need to repeat it here.</strong>
                                                     Add entries only for <em>extra</em> libraries SoulSync should read
                                                     (a second collection, an archive
                                                     drive), or when your media server sees the same files at a different
@@ -7211,6 +7230,28 @@
                                                         <code>${albumtype}s</code> → Albums</small>
                                                 </div>
 
+                                                <div class="form-group">
+                                                    <label>
+                                                        <input type="checkbox" id="detect-multi-artist-compilations" checked>
+                                                        Detect multi-artist compilations
+                                                    </label>
+                                                    <span class="info-icon" role="button" tabindex="0"
+                                                        title="What's this?" onclick="toggleSettingHelp(this)"
+                                                        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
+                                                    <small class="settings-hint setting-help-body" hidden>A soundtrack
+                                                        or compilation is filed under <code>Various Artists</code>
+                                                        instead of whichever contributor happened to be downloading
+                                                        &mdash; without this, one guitarist featured on 45 soundtracks
+                                                        collects all 45 albums. Each track still credits the artist who
+                                                        actually recorded it. A release counts as a compilation when it
+                                                        is credited to Various Artists, when the metadata source types
+                                                        it one, or &mdash; when reorganizing, where the whole tracklist
+                                                        is known &mdash; when three or more tracks have different
+                                                        artists and none of them owns more than half the album. A
+                                                        soundtrack credited to a single composer is left with that
+                                                        composer. Also governs whether reorganize gives compilations
+                                                        their own folder layout.</small>
+                                                </div>
                                                 <div class="form-group">
                                                     <label>Single Path Template:</label>
                                                     <input type="text" id="template-single-path"
@@ -7672,6 +7713,7 @@
                                                         (Édith Piaf → <code>E/</code>). Off = the literal first
                                                         character, exactly as before.</small>
                                                 </div>
+
 
                                                 <div class="form-group">
                                                     <label>Artist Tag Separator:</label>
@@ -10287,48 +10329,145 @@
                             </div>
                             <!-- admin settings modal (cog in the room head) -->
                             <div class="chat-settings-overlay" data-chat-settings-modal hidden>
-                                <div class="chat-settings-modal">
-                                    <h3 class="chat-settings-title">Chat Settings</h3>
-                                    <label class="chat-settings-label">Community room
-                                        <input class="chat-input" data-chat-set-room type="text" maxlength="64"
-                                            placeholder="SoulSync" autocomplete="off">
-                                        <span class="chat-settings-hint">Soulseek room names are case-sensitive</span>
-                                    </label>
-                                    <label class="chat-settings-label">GIPHY API key
-                                        <input class="chat-input" data-chat-set-giphy type="password" placeholder=""
-                                            autocomplete="off">
-                                        <span class="chat-settings-hint">free at developers.giphy.com — enables GIF
-                                            search; leave blank to keep the current key</span>
-                                    </label>
-                                    <label class="chat-settings-label">filepost.dev API key
-                                        <input class="chat-input" data-chat-set-filepost type="password" placeholder=""
-                                            autocomplete="off">
-                                        <span class="chat-settings-hint">free at filepost.dev — enables file sharing in
-                                            chat; leave blank to keep the current key</span>
-                                    </label>
-                                    <label class="chat-settings-label">Shared files expire after
-                                        <select class="chat-input" data-chat-set-filepost-expiry>
-                                            <option value="">Never (permanent link)</option>
-                                            <option value="24h">24 hours</option>
-                                            <option value="7d">7 days</option>
-                                            <option value="30d">30 days</option>
-                                        </select>
-                                    </label>
-                                    <label class="chat-settings-check"><input type="checkbox" data-chat-set-autojoin>
-                                        Auto-join the community room</label>
-                                    <label class="chat-settings-check"><input type="checkbox" data-chat-set-membersend>
-                                        Let non-admin profiles send messages</label>
-                                    <label class="chat-settings-label">Your avatar
-                                        <span class="chat-settings-hint" data-chat-avwho></span></label>
-                                    <div class="chat-avpicker" data-chat-avpicker></div>
-                                    <label class="chat-settings-check"><input type="checkbox" data-chat-set-ping>
-                                        Play a sound when someone mentions or replies to me</label>
-                                    <label class="chat-settings-check"><input type="checkbox" data-chat-set-np>
-                                        Share what I'm playing in the room (everyone in the Soulseek room can see
-                                        it)</label>
-                                    <label class="chat-settings-check"><input type="checkbox" data-chat-set-autoprove>
-                                        Auto-answer "prove you're human" download challenges</label>
-                                    <div class="chat-settings-actions">
+                                <div class="chat-settings-modal chat-set--tabs" role="dialog" aria-modal="true"
+                                    aria-labelledby="chat-set-title">
+                                    <div class="chat-set-head">
+                                        <h3 class="chat-set-title" id="chat-set-title">Chat settings</h3>
+                                        <button type="button" class="chat-set-x" data-chat-settings-cancel
+                                            aria-label="Close">&times;</button>
+                                    </div>
+                                    <div class="chat-set-shell">
+                                        <nav class="chat-set-nav" role="tablist" aria-label="Chat settings sections">
+                                            <button type="button" class="chat-set-tab chat-set-tab--on" role="tab"
+                                                data-chat-settab="profile">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                                    stroke-linecap="round" stroke-linejoin="round">
+                                                    <circle cx="12" cy="8" r="4" />
+                                                    <path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" />
+                                                </svg>Profile</button>
+                                            <button type="button" class="chat-set-tab" role="tab"
+                                                data-chat-settab="alerts">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                                    stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+                                                    <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+                                                </svg>Notifications</button>
+                                            <button type="button" class="chat-set-tab" role="tab"
+                                                data-chat-settab="room">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                                    stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                                                </svg>Room</button>
+                                            <button type="button" class="chat-set-tab" role="tab"
+                                                data-chat-settab="integrations">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                                    stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+                                                    <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+                                                </svg>Integrations</button>
+                                        </nav>
+                                        <div class="chat-set-body">
+                                            <section class="chat-set-panel" data-chat-setpanel="profile">
+                                                <div class="chat-set-me">
+                                                    <span class="chat-set-me-av" data-chat-avpreview></span>
+                                                    <div class="chat-set-me-text">
+                                                        <div class="chat-set-me-name" data-chat-avname></div>
+                                                        <div class="chat-set-desc" data-chat-avwho></div>
+                                                    </div>
+                                                </div>
+                                                <div class="chat-set-h">Avatar
+                                                    <span class="chat-set-h-note">saves as soon as you pick one</span>
+                                                </div>
+                                                <div class="chat-avpicker" data-chat-avpicker></div>
+                                            </section>
+                                            <section class="chat-set-panel" data-chat-setpanel="alerts" hidden>
+                                                <div class="chat-set-h">Notifications</div>
+                                                <label class="chat-set-row">
+                                                    <span class="chat-set-row-text">
+                                                        <span class="chat-set-row-title">Mention sound</span>
+                                                        <span class="chat-set-desc">Play a sound when someone mentions
+                                                            or replies to you. This browser only.</span>
+                                                    </span>
+                                                    <input type="checkbox" class="chat-set-switch" data-chat-set-ping>
+                                                </label>
+                                                <div class="chat-set-h">Privacy</div>
+                                                <label class="chat-set-row">
+                                                    <span class="chat-set-row-text">
+                                                        <span class="chat-set-row-title">Share what I'm playing</span>
+                                                        <span class="chat-set-desc">Everyone in the Soulseek room can
+                                                            see it. This browser only.</span>
+                                                    </span>
+                                                    <input type="checkbox" class="chat-set-switch" data-chat-set-np>
+                                                </label>
+                                            </section>
+                                            <section class="chat-set-panel" data-chat-setpanel="room" hidden>
+                                                <div class="chat-set-h">Community room</div>
+                                                <label class="chat-set-field">
+                                                    <span class="chat-set-row-title">Room name</span>
+                                                    <input class="chat-input" data-chat-set-room type="text" maxlength="64"
+                                                        placeholder="SoulSync" autocomplete="off">
+                                                    <span class="chat-set-desc">Soulseek room names are
+                                                        case-sensitive.</span>
+                                                </label>
+                                                <label class="chat-set-row">
+                                                    <span class="chat-set-row-text">
+                                                        <span class="chat-set-row-title">Auto-join</span>
+                                                        <span class="chat-set-desc">Join the community room when
+                                                            SoulSync connects.</span>
+                                                    </span>
+                                                    <input type="checkbox" class="chat-set-switch" data-chat-set-autojoin>
+                                                </label>
+                                                <label class="chat-set-row">
+                                                    <span class="chat-set-row-text">
+                                                        <span class="chat-set-row-title">Let other profiles send</span>
+                                                        <span class="chat-set-desc">Non-admin profiles can post as
+                                                            this Soulseek account.</span>
+                                                    </span>
+                                                    <input type="checkbox" class="chat-set-switch"
+                                                        data-chat-set-membersend>
+                                                </label>
+                                                <div class="chat-set-h">Soulseek</div>
+                                                <label class="chat-set-row">
+                                                    <span class="chat-set-row-text">
+                                                        <span class="chat-set-row-title">Answer "prove you're
+                                                            human"</span>
+                                                        <span class="chat-set-desc">Auto-answer the challenges some
+                                                            users send before a download.</span>
+                                                    </span>
+                                                    <input type="checkbox" class="chat-set-switch"
+                                                        data-chat-set-autoprove>
+                                                </label>
+                                            </section>
+                                            <section class="chat-set-panel" data-chat-setpanel="integrations" hidden>
+                                                <div class="chat-set-h">GIFs</div>
+                                                <label class="chat-set-field">
+                                                    <span class="chat-set-row-title">GIPHY API key</span>
+                                                    <input class="chat-input" data-chat-set-giphy type="password"
+                                                        placeholder="" autocomplete="off">
+                                                    <span class="chat-set-desc">Free at developers.giphy.com. Enables
+                                                        GIF search. Leave blank to keep the current key.</span>
+                                                </label>
+                                                <div class="chat-set-h">File sharing</div>
+                                                <label class="chat-set-field">
+                                                    <span class="chat-set-row-title">filepost.dev API key</span>
+                                                    <input class="chat-input" data-chat-set-filepost type="password"
+                                                        placeholder="" autocomplete="off">
+                                                    <span class="chat-set-desc">Free at filepost.dev. Enables file
+                                                        sharing in chat. Leave blank to keep the current key.</span>
+                                                </label>
+                                                <label class="chat-set-field">
+                                                    <span class="chat-set-row-title">Shared files expire after</span>
+                                                    <select class="chat-input" data-chat-set-filepost-expiry>
+                                                        <option value="">Never (permanent link)</option>
+                                                        <option value="24h">24 hours</option>
+                                                        <option value="7d">7 days</option>
+                                                        <option value="30d">30 days</option>
+                                                    </select>
+                                                </label>
+                                            </section>
+                                        </div>
+                                    </div>
+                                    <div class="chat-set-foot">
                                         <button type="button" class="modal-button modal-button--secondary"
                                             data-chat-settings-cancel>Cancel</button>
                                         <button type="button" class="modal-button modal-button--primary"

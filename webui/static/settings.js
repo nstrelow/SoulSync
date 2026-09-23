@@ -2898,12 +2898,16 @@ async function loadSettingsData() {
         document.getElementById('soulseek-search-min-delay-seconds').value = settings.soulseek?.search_min_delay_seconds ?? 0;
         document.getElementById('soulseek-min-peer-speed').value = settings.soulseek?.min_peer_upload_speed || 0;
         document.getElementById('soulseek-max-peer-queue').value = settings.soulseek?.max_peer_queue || 0;
+        document.getElementById('soulseek-observed-speed-fallback-enabled').checked = settings.soulseek?.observed_speed_fallback_enabled === true;
+        document.getElementById('soulseek-min-observed-download-speed').value = settings.soulseek?.min_observed_download_speed_kbps ?? 250;
         document.getElementById('soulseek-download-timeout').value = Math.round((settings.soulseek?.download_timeout || 600) / 60);
         document.getElementById('soulseek-auto-clear-searches').checked = settings.soulseek?.auto_clear_searches !== false;
 
         // Populate ListenBrainz settings
         document.getElementById('listenbrainz-base-url').value = settings.listenbrainz?.base_url || '';
         document.getElementById('listenbrainz-token').value = settings.listenbrainz?.token || '';
+        const _lbUser = document.getElementById('listenbrainz-username');
+        if (_lbUser) _lbUser.value = settings.listenbrainz?.username || '';
 
         // Populate AcoustID settings
         document.getElementById('acoustid-api-key').value = settings.acoustid?.api_key || '';
@@ -3264,6 +3268,10 @@ async function loadSettingsData() {
         document.getElementById('disc-label').value = settings.file_organization?.disc_label || 'Disc';
         document.getElementById('collab-artist-mode').value = settings.file_organization?.collab_artist_mode || 'first';
         document.getElementById('artistletter-symbol-fallback').checked = settings.file_organization?.artistletter_symbol_fallback === true;
+        // !== false, not === true: the backend default is ON, so an install
+        // that has never saved this key must show it ON or the checkbox lies
+        // about what the importer is doing.
+        document.getElementById('detect-multi-artist-compilations').checked = settings.file_organization?.detect_multi_artist_compilations !== false;
         document.getElementById('artist-separator').value = settings.metadata_enhancement?.tags?.artist_separator || ', ';
         document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
         document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
@@ -6038,6 +6046,8 @@ async function saveSettings(quiet = false) {
             search_min_delay_seconds: parseInt(document.getElementById('soulseek-search-min-delay-seconds').value) || 0,
             min_peer_upload_speed: parseInt(document.getElementById('soulseek-min-peer-speed').value) || 0,
             max_peer_queue: parseInt(document.getElementById('soulseek-max-peer-queue').value) || 0,
+            observed_speed_fallback_enabled: document.getElementById('soulseek-observed-speed-fallback-enabled').checked,
+            min_observed_download_speed_kbps: _cfgInt('soulseek-min-observed-download-speed', 250),
             preferred_version: _cfgStr('preferred-version'),
             download_timeout: (parseInt(document.getElementById('soulseek-download-timeout').value) || 10) * 60,
             auto_clear_searches: document.getElementById('soulseek-auto-clear-searches').checked
@@ -6045,6 +6055,7 @@ async function saveSettings(quiet = false) {
         listenbrainz: {
             base_url: document.getElementById('listenbrainz-base-url').value,
             token: document.getElementById('listenbrainz-token').value,
+            username: _cfgStr('listenbrainz-username', { trim: true }),
             scrobble_enabled: document.getElementById('listenbrainz-scrobble-enabled').checked,
         },
         acoustid: {
@@ -6230,6 +6241,7 @@ async function saveSettings(quiet = false) {
             disc_label: document.getElementById('disc-label').value,
             collab_artist_mode: document.getElementById('collab-artist-mode').value,
             artistletter_symbol_fallback: document.getElementById('artistletter-symbol-fallback').checked,
+            detect_multi_artist_compilations: document.getElementById('detect-multi-artist-compilations').checked,
             templates: {
                 album_path: document.getElementById('template-album-path').value,
                 single_path: document.getElementById('template-single-path').value,
